@@ -84,3 +84,104 @@ The complexity that was removed from the model graph is now managed by the nativ
 
 - **FP32 Tracing to FP16 Conversion**: The most stable path to an ANE-compatible model was to keep the PyTorch model and inputs in `float32`, trace it, and then convert to Core ML with `compute_precision=ct.precision.FLOAT16`.
   - **Resolution**: Removed all `.half()` calls before tracing. Ensured all `ct.TensorType` dtypes were `np.float32`. Set `compute_precision` in `ct.convert` to `ct.precision.FLOAT16` for the final, optimized model.
+
+## 6. Baseline Performance (CPU/PyTorch Fallback) — 2025‑08‑18
+
+This baseline was captured before enabling GPU/ANE acceleration. The hybrid pipeline fell back to pure PyTorch (CPU) because the CoreML vocoder was not yet integrated.
+
+- **Environment**:
+  - Hardware: Mac Studio (Model Identifier: Mac14,14), Apple M2 Ultra (24‑core CPU: 16P + 8E), 64 GB RAM
+  - Software: macOS 15.6 (24G84), Darwin 24.6.0
+  - Torch 2.5.0, coremltools 8.3.0
+  - Acceleration: MPS/GPU and ANE not used (CPU fallback)
+- **Method**:
+  - Ran `kokoro-coreml/test_ane_pipeline.py` which generates and times several sentences; saved WAVs to `kokoro-coreml/outputs/`.
+  - Voice: `af_heart`, speed: `1.0`, sample rate: 24 kHz.
+- **Results** (synthesis time vs. audio duration; lower RTF is faster):
+  - "Hello world!": 2.994 s compute for 1.550 s audio → RTF ≈ 1.93× (overhead‑dominated)
+  - "The quick brown fox …": 1.768 s for 3.250 s → RTF ≈ 0.54× (faster than real‑time)
+  - Longer sentence A: 2.158 s for 5.950 s → RTF ≈ 0.36×
+  - Longer sentence B: 2.378 s for 6.000 s → RTF ≈ 0.40×
+- **Takeaway**: Even on CPU, typical sentences are already sub‑real‑time. Short clips look slower due to fixed startup overhead.
+
+### Immediate Optimization Plan
+1. Enable GPU (MPS) for PyTorch components to reduce latency 2–3×.
+2. Finish CoreML vocoder export and integrate it (ANE acceleration) for an additional ~30–50% overall speedup.
+3. Add duration‑>bucket selection + alignment build in Swift to drive the CoreML synthesizer models.
+4. Verification: Instruments Core ML template (Neural Engine activity) and `sudo powermetrics -i 1000 --samplers ane`.
+
+## 7. Vocoder Export Breakthrough — 2025‑08‑18
+
+- Problem: Converter errored on `multiply` inside harmonic/noise source of `Generator.m_source` and had f0/asr temporal mismatches when tracing generator-only.
+- Fix:
+  - Forced full `Decoder` export to keep F0/N alignment correct.
+  - Introduced a minimal `DummySource` to replace `generator.m_source` during export, returning zeros for harmonic and noise sources. This avoids unsupported ops while preserving shapes.
+  - Used FP32 input dtypes with `minimum_deployment_target=macOS13` and `compute_precision=FLOAT16` for ANE-friendly weights.
+- Result: Successful Core ML conversion of vocoder to `kokoro-coreml/KokoroVocoder.mlpackage`. Next step is to validate ANE usage and objective audio quality vs PyTorch baseline.
+- Result: Successful Core ML conversion of vocoder to `kokoro-coreml/coreml/KokoroVocoder.mlpackage` (output name currently `var_2778`; will remap to `waveform` at integration time). Initial audio revealed timbre issues due to a simplified source; replaced with a multi‑harmonic CoreML‑friendly source (cumsum/sin over overtones) and added overlap‑add stitching to reduce seam artifacts. Next: implement exact hn‑nsf source via MIL custom ops to match PyTorch parity.
+
+### Reproduce Baseline Audio Locally
+Outputs saved by the baseline run:
+
+```
+kokoro-coreml/outputs/sample_01.wav
+kokoro-coreml/outputs/sample_02.wav
+```
+
+Quick one‑off generation (PyTorch path):
+
+```bash
+/Users/mattmireles/Documents/GitHub/talktome/.venv-coreml/bin/python - <<'PY'
+from kokoro import KPipeline
+import soundfile as sf
+text = "TalkToMe is speaking using Kokoro. This sounds pretty good."
+pipeline = KPipeline(lang_code='a')
+for _, _, audio in pipeline(text, voice='af_heart', speed=1.0):
+    sf.write('out.wav', audio, 24000)
+    break
+print('Wrote out.wav')
+PY
+```
+
+## 8. GPU (MPS) Benchmark — 2025‑08‑18
+
+Ran a quick pass forcing PyTorch to use Apple GPU (MPS) for Kokoro’s PyTorch path.
+
+- Command (from `kokoro-coreml/`):
+
+```bash
+PYTORCH_ENABLE_MPS_FALLBACK=1 \
+  /Users/mattmireles/Documents/GitHub/talktome/.venv-coreml/bin/python - <<'PY'
+import os, time, torch, soundfile as sf
+from kokoro import KPipeline
+from kokoro.model import KModel
+device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
+pipeline = KPipeline(lang_code='a', model=False)
+model = KModel().to(device).eval()
+texts = [
+  "Hello world!",
+  "The quick brown fox jumps over the lazy dog.",
+  "This is a longer sentence that will test the performance of our pipeline running on the Apple GPU.",
+]
+os.makedirs('outputs_mps', exist_ok=True)
+for i, text in enumerate(texts, 1):
+  voice='af_heart'; phonemes=None
+  for _, ps, _ in pipeline(text, voice=voice, speed=1.0): phonemes=ps; break
+  ref_s = pipeline.load_voice(voice)[len(phonemes)-1].to(device)
+  t0=time.time();
+  with torch.no_grad(): audio = model(phonemes, ref_s, speed=1.0)
+  dt=time.time()-t0
+  a = audio.cpu().numpy(); sr=24000
+  sf.write(f'outputs_mps/sample_mps_{i:02d}.wav', a, sr)
+  L=len(a)/sr; print(f"{L:.3f}s audio in {dt:.3f}s → RTF {dt/L:.3f}x")
+PY
+```
+
+- Results (M2 Ultra, macOS 15.6, Torch 2.5.0):
+  - Hello world!: 1.550 s in 11.724 s → RTF ≈ 7.564× (slower than CPU; dominated by fallbacks/transfer)
+  - Quick brown fox: 3.250 s in 4.958 s → RTF ≈ 1.526× (slower than real‑time)
+  - Longer sentence: 6.575 s in 4.127 s → RTF ≈ 0.628× (faster than real‑time)
+
+- Observation: `aten::angle` not supported on MPS, falls back to CPU in `istftnet.py`; mixed MPS↔CPU execution adds overhead, hurting short/medium inputs. MPS is not a net win here without removing fallbacks or moving to CoreML.
+
+- Action: Prioritize CoreML vocoder (ANE) integration; continue synthesizer bucketing; keep PyTorch on CPU (or isolate ops) to avoid MPS<->CPU ping‑pong in interim.

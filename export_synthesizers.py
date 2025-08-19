@@ -117,7 +117,11 @@ class SynthesizerModel(nn.Module):
 
     def forward(self, d: torch.FloatTensor, t_en: torch.FloatTensor, s: torch.FloatTensor, ref_s: torch.FloatTensor, pred_aln_trg: torch.FloatTensor):
         k = self.kmodel
-        en = d.transpose(-1, -2) @ pred_aln_trg
+        # Align temporal lengths: resample t_en to match d along time for stable tracing
+        if t_en.shape[-1] != d.shape[-1]:
+            t_en = torch.nn.functional.interpolate(t_en, size=d.shape[-1], mode='nearest')
+        # Align duration features (batch, hidden, time) with alignment (time, frames).
+        en = torch.einsum('bth,tf->btf', d.transpose(-1, -2), pred_aln_trg)
         
         # Manually replicate F0Ntrain to avoid tracer-hostile code
         x, _ = k.predictor.shared(en.transpose(-1, -2))
@@ -131,7 +135,8 @@ class SynthesizerModel(nn.Module):
             N = block(N, s)
         N_pred = k.predictor.N_proj(N).squeeze(1)
 
-        asr = t_en @ pred_aln_trg
+        # t_en: (B, H, T). Align to frames: (B, H, F)
+        asr = torch.einsum('bht,tf->bhf', t_en, pred_aln_trg)
         audio = k.decoder(asr, F0_pred, N_pred, ref_s[:, :128]).squeeze(0)
         return audio
 
@@ -154,12 +159,13 @@ def remove_dropout(module):
 # --- Main Export Logic ---
 
 def prepare_pytorch_models(config_path, checkpoint_path):
-    """Loads the KModel from the specified checkpoint."""
+    """Loads the KModel, falling back to auto-download if checkpoint missing."""
     if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Config file not found: {config_path}")
+        print(f"⚠️ Config file not found: {config_path}. Falling back to auto-download.")
+        return KModel(disable_complex=True)
     if not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
-
+        print(f"⚠️ Checkpoint not found: {checkpoint_path}. Falling back to auto-download from HF.")
+        return KModel(config=config_path, disable_complex=True)
     return KModel(config=config_path, model=checkpoint_path, disable_complex=True)
 
 def export_synthesizers(output_dir, buckets_str, debug=False):
@@ -184,6 +190,8 @@ def export_synthesizers(output_dir, buckets_str, debug=False):
     
     with torch.no_grad():
         _, d, t_en, s, ref_s_out = duration_model(input_ids, ref_s, speed, attention_mask)
+    # Use actual temporal length from produced tensors to avoid trace mismatches
+    trace_length = int(d.shape[-1])
     
     # Define buckets
     # e.g., "3s,5s,10s"
@@ -202,6 +210,13 @@ def export_synthesizers(output_dir, buckets_str, debug=False):
         print(f"\n--- Exporting Synthesizer for Bucket: {name} ({frame_count} frames) ---")
         synthesizer_file = os.path.join(output_dir, f"kokoro_synthesizer_{name}.mlpackage")
 
+        # Align per 10x frames per token (24kHz, 600 hop -> ~10 frames/token typical)
+        frames_per_token = 10
+        effective_t = trace_length * frames_per_token
+        if effective_t != frame_count:
+            # For debug, reduce frame_count to match alignment length
+            print(f"Adjusting frame_count from {frame_count} to {effective_t} to match trace_length alignment")
+            frame_count = effective_t
         pred_aln_trg = torch.zeros((trace_length, frame_count), dtype=torch.float32)
         
         print(f"[{time.ctime()}] Tracing model with torch.jit.trace...")

@@ -35,9 +35,11 @@ except ImportError:
     SOUNDFILE_AVAILABLE = False
     print("ℹ️ soundfile not available - audio saving will be skipped")
 
-# Check if CoreML conversion worked
-COREML_MODEL_PATH = "KokoroVocoder.mlpackage"
-COREML_AVAILABLE = os.path.exists(COREML_MODEL_PATH)
+BASE_DIR = Path(__file__).parent
+# Check if CoreML conversion worked (resolve relative to this file)
+COREML_MODEL_PATH = str(BASE_DIR / "coreml" / "KokoroVocoder.mlpackage")
+COREML_DECODER_HAR_PATH = str(BASE_DIR / "coreml" / "KokoroDecoder_HAR.mlpackage")
+COREML_AVAILABLE = os.path.exists(COREML_MODEL_PATH) or os.path.exists(COREML_DECODER_HAR_PATH)
 
 if COREML_AVAILABLE:
     try:
@@ -47,6 +49,7 @@ if COREML_AVAILABLE:
         print("ℹ️ coremltools not available - using PyTorch only")
 
 from kokoro import KModel, KPipeline
+import argparse
 
 class HybridTTSPipeline:
     """
@@ -60,7 +63,7 @@ class HybridTTSPipeline:
     while providing significant performance improvements for the vocoder stage.
     """
     
-    def __init__(self):
+    def __init__(self, force_engine: str | None = None):
         """Initialize the hybrid pipeline with both PyTorch and CoreML components."""
         print("🚀 Initializing Hybrid ANE-Accelerated TTS Pipeline...")
         
@@ -70,20 +73,60 @@ class HybridTTSPipeline:
         self.pipeline = KPipeline(lang_code='a', model=False)  # English pipeline
         print("✅ PyTorch components loaded")
         
-        # Initialize CoreML vocoder if available
-        if COREML_AVAILABLE:
+        # Initialize CoreML models if available
+        if COREML_AVAILABLE and (force_engine is None or force_engine == 'coreml'):
             print("🍎 Loading CoreML vocoder...")
             try:
-                self.coreml_vocoder = ct.models.MLModel(COREML_MODEL_PATH)
-                self.use_coreml = True
-                print("✅ CoreML vocoder loaded successfully")
+                self.coreml_vocoder = ct.models.MLModel(COREML_MODEL_PATH) if os.path.exists(COREML_MODEL_PATH) else None
+                self.coreml_decoder_har = ct.models.MLModel(COREML_DECODER_HAR_PATH) if os.path.exists(COREML_DECODER_HAR_PATH) else None
+                # Load synthesizer bucket models if present (search local and parent coreml dirs)
+                import glob
+                self.coreml_synth_buckets = {}
+                synth_globs = [
+                    str(BASE_DIR / "coreml" / "kokoro_synthesizer_*s.mlpackage"),
+                    str((BASE_DIR.parent / "coreml" / "kokoro_synthesizer_*s.mlpackage"))
+                ]
+                for g in synth_globs:
+                    for path in glob.glob(g):
+                        try:
+                            model = ct.models.MLModel(path)
+                            base = os.path.basename(path)
+                            sec_str = base.split("_")[-1].replace("s.mlpackage", "").replace(".mlpackage", "")
+                            sec = int(sec_str.replace('s','')) if sec_str.endswith('s') else int(sec_str)
+                            self.coreml_synth_buckets[sec] = model
+                            print(f"✅ Loaded Synthesizer bucket: {sec}s → {path}")
+                        except Exception as e:
+                            print(f"⚠️ Failed to load synthesizer bucket {path}: {e}")
+                # Load Decoder_HAR bucket models if present (search local and parent coreml dirs)
+                self.coreml_decoder_har_buckets = {}
+                har_globs = [
+                    str(BASE_DIR / "coreml" / "KokoroDecoder_HAR_*s.mlpackage"),
+                    str((BASE_DIR.parent / "coreml" / "KokoroDecoder_HAR_*s.mlpackage"))
+                ]
+                for g in har_globs:
+                    for path in glob.glob(g):
+                        try:
+                            model = ct.models.MLModel(path)
+                            base = os.path.basename(path)
+                            # KokoroDecoder_HAR_XXs.mlpackage
+                            sec = int(base.split('_')[-1].replace('s.mlpackage',''))
+                            self.coreml_decoder_har_buckets[sec] = model
+                            print(f"✅ Loaded Decoder_HAR bucket: {sec}s → {path}")
+                        except Exception as e:
+                            print(f"⚠️ Failed to load Decoder_HAR bucket {path}: {e}")
+                self.use_coreml = self.coreml_vocoder is not None or self.coreml_decoder_har is not None
+                if self.coreml_vocoder is not None:
+                    print("✅ CoreML vocoder loaded successfully")
+                if self.coreml_decoder_har is not None:
+                    print("✅ CoreML Decoder_HAR loaded successfully (exact hn-nsf parity)")
                 
                 # Print vocoder specifications
                 print("\n📋 CoreML Vocoder Info:")
-                for input_spec in self.coreml_vocoder.get_spec().description.input:
-                    print(f"  Input - {input_spec.name}: {input_spec.type}")
-                for output_spec in self.coreml_vocoder.get_spec().description.output:
-                    print(f"  Output - {output_spec.name}: {output_spec.type}")
+                if self.coreml_vocoder is not None:
+                    for input_spec in self.coreml_vocoder.get_spec().description.input:
+                        print(f"  Input - {input_spec.name}: {input_spec.type}")
+                    for output_spec in self.coreml_vocoder.get_spec().description.output:
+                        print(f"  Output - {output_spec.name}: {output_spec.type}")
                     
             except Exception as e:
                 print(f"⚠️ CoreML vocoder loading failed: {e}")
@@ -93,6 +136,10 @@ class HybridTTSPipeline:
             print("⚠️ CoreML vocoder not found, using PyTorch-only pipeline")
             self.use_coreml = False
             
+        # Consider bucket models as CoreML availability
+        if getattr(self, 'coreml_synth_buckets', None) or getattr(self, 'coreml_decoder_har_buckets', None):
+            self.use_coreml = True
+            print(f"✅ Buckets → synth: {len(getattr(self, 'coreml_synth_buckets', {}))}, decoder_har: {len(getattr(self, 'coreml_decoder_har_buckets', {}))}")
         print(f"\n🎯 Pipeline Mode: {'Hybrid (PyTorch + CoreML)' if self.use_coreml else 'PyTorch Only'}")
     
     def extract_vocoder_inputs(self, text, voice='af_heart', speed=1.0):
@@ -180,7 +227,12 @@ class HybridTTSPipeline:
                     'asr': asr.cpu().numpy().astype(np.float32),
                     'f0_curve': F0_pred.cpu().numpy().astype(np.float32), 
                     'n': N_pred.cpu().numpy().astype(np.float32),
-                    's': ref_s[:, :128].cpu().numpy().astype(np.float32)  # Style embedding
+                    's': ref_s[:, :128].cpu().numpy().astype(np.float32),  # Style embedding
+                    # Additional intermediates for synthesizer bucket path
+                    'd': d.cpu().numpy().astype(np.float32),
+                    't_en': t_en.cpu().numpy().astype(np.float32),
+                    'pred_dur': pred_dur.cpu().numpy().astype(np.int64),
+                    'ref_s': ref_s.cpu().numpy().astype(np.float32),
                 }
                 
                 print("✅ Successfully extracted vocoder inputs")
@@ -210,17 +262,450 @@ class HybridTTSPipeline:
         if not self.use_coreml:
             print("❌ CoreML vocoder not available")
             return None
+
+    def run_coreml_decoder_har(self, vocoder_inputs):
+        """
+        Run CoreML Decoder_HAR (exact hn-nsf parity). PyTorch computes har_spec/har_phase.
+        """
+        if getattr(self, 'coreml_decoder_har', None) is None:
+            print("❌ CoreML Decoder_HAR not available")
+            return None
+        # Existing windowed path retained below
+
+    def _select_bucket_seconds(self, total_seconds: float) -> int | None:
+        """Pick the smallest available bucket >= total_seconds from any loaded bucket set."""
+        candidates = []
+        if getattr(self, 'coreml_synth_buckets', None):
+            candidates.extend(self.coreml_synth_buckets.keys())
+        if getattr(self, 'coreml_decoder_har_buckets', None):
+            candidates.extend(self.coreml_decoder_har_buckets.keys())
+        candidates = sorted(set(candidates))
+        if not candidates:
+            return None
+        for sec in candidates:
+            if sec >= int(np.ceil(total_seconds)):
+                return sec
+        return candidates[-1]
+
+    def _build_alignment_matrix(self, pred_dur_tokens: np.ndarray, trace_length: int, frame_count: int) -> np.ndarray:
+        """Construct pred_aln_trg of shape (trace_length, frame_count) with one-hot repeats."""
+        # Pad or truncate token durations to trace_length
+        pred_dur = np.zeros((trace_length,), dtype=np.int64)
+        L = min(trace_length, pred_dur_tokens.shape[-1])
+        pred_dur[:L] = pred_dur_tokens[:L]
+        # Total frames limited by frame_count
+        repeat_idx = np.repeat(np.arange(trace_length), pred_dur)
+        if repeat_idx.size > frame_count:
+            repeat_idx = repeat_idx[:frame_count]
+        else:
+            # pad with last valid token index
+            pad = frame_count - repeat_idx.size
+            last_idx = repeat_idx[-1] if repeat_idx.size > 0 else 0
+            repeat_idx = np.concatenate([repeat_idx, np.full((pad,), last_idx, dtype=repeat_idx.dtype)])
+        mat = np.zeros((trace_length, frame_count), dtype=np.float32)
+        mat[repeat_idx, np.arange(frame_count)] = 1.0
+        return mat
+
+    def run_coreml_synth_bucket(self, text, voice='af_heart', speed=1.0):
+        """Single-shot bucketed synthesis using CoreML synthesizer model."""
+        if not getattr(self, 'coreml_synth_buckets', None):
+            return None
+        # Extract intermediates
+        vi = self.extract_vocoder_inputs(text, voice, speed)
+        if vi is None:
+            return None
+        # Estimate total seconds from predicted frames (f0 frames ~80 Hz)
+        total_f0_frames = int(vi['f0_curve'].shape[-1])
+        total_seconds = total_f0_frames / 80.0
+        sec = self._select_bucket_seconds(total_seconds)
+        if sec is None:
+            print("❌ No synthesizer buckets available")
+            return None
+        model = self.coreml_synth_buckets[sec]
+        # Inspect model input shapes to get trace_length and frame_count
+        spec = model.get_spec()
+        input_shapes = {i.name: i.type.multiArrayType.shape for i in spec.description.input}
+        # Shapes are stored as list of dimensions
+        d_shape = input_shapes.get('d') or next(iter(input_shapes.values()))
+        trace_length = int(d_shape[-1])
+        pred_shape = input_shapes.get('pred_aln_trg')
+        frame_count = int(pred_shape[-1]) if pred_shape else sec * 24000
+
+        # Prepare inputs: pad/truncate d, t_en along temporal dimension
+        def pad_time(x, T):
+            # x shape (1, H, t)
+            h = x.shape[1]
+            out = np.zeros((1, h, T), dtype=np.float32)
+            t = min(T, x.shape[-1])
+            out[:, :, :t] = x[:, :, :t]
+            return out
+
+        d = pad_time(vi['d'], trace_length)
+        t_en = pad_time(vi['t_en'], trace_length)
+        s = vi['s'].astype(np.float32)
+        ref_s = vi['ref_s'].astype(np.float32)
+        pred_aln_trg = self._build_alignment_matrix(vi['pred_dur'].reshape(-1), trace_length, frame_count)
+
+        inputs = {
+            'd': d,
+            't_en': t_en,
+            's': s,
+            'ref_s': ref_s,
+            'pred_aln_trg': pred_aln_trg,
+        }
+        print(f"🍎 Running bucket synthesizer {sec}s: trace={trace_length}, frames={frame_count}")
+        res = model.predict(inputs)
+        key = list(res.keys())[0]
+        audio = res[key].squeeze().astype(np.float32)
+        # Trim potential silence beyond predicted seconds
+        target_len = int(sec * 24000)
+        return audio[:target_len]
+        print("🍎 Running CoreML Decoder_HAR (exact hn-nsf)...")
+        try:
+            # Unpack inputs
+            asr = vocoder_inputs['asr'].astype(np.float32)   # (1, 512, T_asr)
+            f0 = vocoder_inputs['f0_curve'].astype(np.float32)  # (1, T_f0)
+            n = vocoder_inputs['n'].astype(np.float32)       # (1, T_n)
+            s = vocoder_inputs['s'].astype(np.float32)       # (1, 128)
+
+            # Window sizes must match CoreML trace shapes
+            asr_win, f0_win = 200, 400
+            T_asr = asr.shape[-1]
+            T_f0 = f0.shape[-1]
+            hop_f0 = f0_win // 4
+            hop_asr = asr_win // 4
+            num_windows = int(np.ceil((T_f0 - f0_win) / hop_f0)) + 1 if T_f0 > 0 else 0
+
+            # Prepare buffers lazily after first chunk
+            out_audio = None
+            acc = None
+            hann = None
+            chunk_len = None
+
+            dec = self.pytorch_model.decoder
+            import torch
+            with torch.no_grad():
+                for w in range(num_windows):
+                    f0_start = w * hop_f0
+                    f0_end = f0_start + f0_win
+                    asr_start = w * hop_asr
+                    asr_end = asr_start + asr_win
+                    # Zero-padded slices
+                    f0_slice = np.zeros((1, f0_win), dtype=np.float32)
+                    n_slice = np.zeros((1, f0_win), dtype=np.float32)
+                    asr_slice = np.zeros((1, 512, asr_win), dtype=np.float32)
+                    if f0_start < T_f0:
+                        f0_slice_len = max(0, min(f0_end, T_f0) - f0_start)
+                        if f0_slice_len > 0:
+                            f0_slice[:, :f0_slice_len] = f0[:, f0_start:f0_start+f0_slice_len]
+                    if f0_start < n.shape[-1]:
+                        n_slice_len = max(0, min(f0_end, n.shape[-1]) - f0_start)
+                        if n_slice_len > 0:
+                            n_slice[:, :n_slice_len] = n[:, f0_start:f0_start+n_slice_len]
+                    if asr_start < T_asr:
+                        asr_slice_len = max(0, min(asr_end, T_asr) - asr_start)
+                        if asr_slice_len > 0:
+                            asr_slice[:, :, :asr_slice_len] = asr[:, :, asr_start:asr_start+asr_slice_len]
+
+                    # Build har via exact PyTorch hn-nsf path
+                    f0_up = dec.generator.f0_upsamp(torch.from_numpy(f0_slice)[:,None]).transpose(1,2)
+                    har_source, _, _ = dec.generator.m_source(f0_up)
+                    har_source = har_source.transpose(1,2).squeeze(1)
+                    har_spec, har_phase = dec.generator.stft.transform(har_source)
+
+                    # Prepare CoreML inputs
+                    inputs = {
+                        'asr': asr_slice.reshape(1, 512, 1, asr_win),
+                        'f0_curve': f0_slice.reshape(1, 1, 1, f0_win),
+                        'n': n_slice.reshape(1, 1, 1, f0_win),
+                        's': s,
+                        'har_spec': har_spec.numpy().astype(np.float32).reshape(1, har_spec.shape[1], 1, har_spec.shape[2]),
+                        'har_phase': har_phase.numpy().astype(np.float32).reshape(1, har_phase.shape[1], 1, har_phase.shape[2]),
+                    }
+                    res = self.coreml_decoder_har.predict(inputs)
+                    key = list(res.keys())[0]
+                    x = res[key]
+                    # Map to waveform using exact non-linearities + inverse STFT in PyTorch
+                    x_t = torch.from_numpy(x)
+                    n_fft = dec.generator.post_n_fft
+                    spec = torch.exp(x_t[:,:n_fft//2+1,:])
+                    phase = torch.sin(x_t[:, n_fft//2+1:,:])
+                    chunk = dec.generator.stft.inverse(spec, phase).squeeze().numpy()
+
+                    if chunk_len is None:
+                        chunk_len = len(chunk)
+                        samples_per_f0_frame = chunk_len // f0_win
+                        hop_samples = hop_f0 * samples_per_f0_frame
+                        total_len = max(chunk_len, chunk_len + (num_windows - 1) * hop_samples)
+                        out_audio = np.zeros((total_len,), dtype=np.float32)
+                        acc = np.zeros_like(out_audio)
+                        hann = np.hanning(chunk_len).astype(np.float32)
+
+                    dst_start = w * hop_samples
+                    dst_end = dst_start + chunk_len
+                    if dst_end > out_audio.shape[0]:
+                        extend = dst_end - out_audio.shape[0]
+                        out_audio = np.concatenate([out_audio, np.zeros((extend,), dtype=np.float32)])
+                        acc = np.concatenate([acc, np.zeros((extend,), dtype=np.float32)])
+                    out_audio[dst_start:dst_end] += chunk * hann
+                    acc[dst_start:dst_end] += hann
+
+            valid_idx = np.nonzero(acc > 1e-6)[0]
+            if valid_idx.size == 0:
+                return None
+            last = valid_idx.max() + 1
+            audio = out_audio[:last] / np.maximum(acc[:last], 1e-6)
+            return audio
+        except Exception as e:
+            print(f"❌ CoreML Decoder_HAR failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def run_coreml_decoder_har_bucket(self, text, voice='af_heart', speed=1.0):
+        """Single-shot Decoder_HAR bucket: compute har once, call CoreML once, inverse STFT once."""
+        if not getattr(self, 'coreml_decoder_har_buckets', None):
+            return None
+        vi = self.extract_vocoder_inputs(text, voice, speed)
+        if vi is None:
+            return None
+        # Determine required seconds from f0 length
+        T_f0 = int(vi['f0_curve'].shape[-1])
+        total_seconds = T_f0 / 80.0
+        sec = self._select_bucket_seconds(total_seconds)
+        if sec is None or sec not in self.coreml_decoder_har_buckets:
+            return None
+        model = self.coreml_decoder_har_buckets[sec]
+        # Inspect shapes from model spec
+        spec = model.get_spec()
+        shapes = {i.name: i.type.multiArrayType.shape for i in spec.description.input}
+        asr_len = int(shapes['asr'][-1])
+        f0_len = int(shapes['f0_curve'][-1])
+        # Prepare padded inputs
+        def pad_tail(x, T, axis=-1):
+            out = np.zeros(list(x.shape[:-1])+[T], dtype=x.dtype)
+            t = min(T, x.shape[axis])
+            out[(slice(None),)* (out.ndim-1) + (slice(0,t),)] = x[(slice(None),)* (x.ndim-1) + (slice(0,t),)]
+            return out
+        asr = vi['asr'].astype(np.float32)
+        f0 = vi['f0_curve'].astype(np.float32)
+        n = vi['n'].astype(np.float32)
+        s = vi['s'].astype(np.float32)
+        asr_pad = np.zeros((1, 512, asr_len), dtype=np.float32)
+        t_asr = min(asr_len, asr.shape[-1])
+        asr_pad[:, :, :t_asr] = asr[:, :, :t_asr]
+        f0_pad = np.zeros((1, f0_len), dtype=np.float32)
+        n_pad = np.zeros((1, f0_len), dtype=np.float32)
+        t_f0 = min(f0_len, f0.shape[-1])
+        f0_pad[:, :t_f0] = f0[:, :t_f0]
+        n_pad[:, :t_f0] = n[:, :t_f0]
+        # Compute har from full f0 using PyTorch exact path
+        dec = self.pytorch_model.decoder
+        import torch
+        with torch.no_grad():
+            f0_up = dec.generator.f0_upsamp(torch.from_numpy(f0_pad)[:, None]).transpose(1, 2)
+            har_source, _, _ = dec.generator.m_source(f0_up)
+            har_source = har_source.transpose(1, 2).squeeze(1)
+            har_spec, har_phase = dec.generator.stft.transform(har_source)
+        inputs = {
+            'asr': asr_pad.reshape(1, 512, 1, asr_len),
+            'f0_curve': f0_pad.reshape(1, 1, 1, f0_len),
+            'n': n_pad.reshape(1, 1, 1, f0_len),
+            's': s,
+            'har_spec': har_spec.numpy().astype(np.float32).reshape(1, har_spec.shape[1], 1, har_spec.shape[2]),
+            'har_phase': har_phase.numpy().astype(np.float32).reshape(1, har_phase.shape[1], 1, har_phase.shape[2]),
+        }
+        res = model.predict(inputs)
+        key = list(res.keys())[0]
+        x = res[key]
+        # Inverse STFT via PyTorch
+        with torch.no_grad():
+            n_fft = dec.generator.post_n_fft
+            x_t = torch.from_numpy(x)
+            spec_t = torch.exp(x_t[:, :n_fft//2+1, :])
+            phase_t = torch.sin(x_t[:, n_fft//2+1:, :])
+            audio = dec.generator.stft.inverse(spec_t, phase_t).squeeze().numpy()
+        # Trim padded tail using actual f0 content length (t_f0)
+        samples_per_f0_frame = len(audio) / float(f0_len)
+        target_len = int(round(samples_per_f0_frame * t_f0))
+        return audio[:target_len]
+
+    def run_coreml_decoder_har_grouped(self, vocoder_inputs):
+        """Greedy large-bucket segmentation with minimal calls and seam crossfades."""
+        if not getattr(self, 'coreml_decoder_har_buckets', None):
+            return None
+        # Unpack
+        asr = vocoder_inputs['asr'].astype(np.float32)   # (1, 512, T_asr)
+        f0 = vocoder_inputs['f0_curve'].astype(np.float32)  # (1, T_f0)
+        n = vocoder_inputs['n'].astype(np.float32)
+        s = vocoder_inputs['s'].astype(np.float32)
+        T_asr = asr.shape[-1]
+        T_f0 = f0.shape[-1]
+        # Available buckets seconds sorted descending
+        bucket_secs = sorted(self.coreml_decoder_har_buckets.keys(), reverse=True)
+        # Build a schedule of (sec, f0_start) covering T_f0 with 10% overlap per segment
+        schedule = []
+        f0_pos = 0
+        while f0_pos < T_f0:
+            chosen = None
+            for sec in bucket_secs:
+                model = self.coreml_decoder_har_buckets[sec]
+                spec = model.get_spec()
+                shapes = {i.name: i.type.multiArrayType.shape for i in spec.description.input}
+                f0_len = int(shapes['f0_curve'][-1])
+                if f0_len <= T_f0 - f0_pos or sec == bucket_secs[-1]:
+                    chosen = (sec, f0_len)
+                    break
+            if chosen is None:
+                break
+            sec, f0_len = chosen
+            overlap = max(0, int(round(0.1 * f0_len)))  # 10% crossfade
+            schedule.append((sec, f0_pos, f0_len))
+            f0_pos += max(1, f0_len - overlap)
+        # Aggregate
+        out_audio = None
+        acc = None
+        samples_per_f0_frame = None
+        import torch
+        dec = self.pytorch_model.decoder
+        for idx, (sec, f0_start, f0_len) in enumerate(schedule):
+            model = self.coreml_decoder_har_buckets[sec]
+            spec = model.get_spec()
+            shapes = {i.name: i.type.multiArrayType.shape for i in spec.description.input}
+            asr_len = int(shapes['asr'][-1])
+            f0_slice = np.zeros((1, f0_len), dtype=np.float32)
+            n_slice = np.zeros((1, f0_len), dtype=np.float32)
+            asr_slice = np.zeros((1, 512, asr_len), dtype=np.float32)
+            asr_start = f0_start // 2
+            t_f0_avail = max(0, min(f0_start + f0_len, T_f0) - f0_start)
+            t_asr_avail = max(0, min(asr_start + asr_len, T_asr) - asr_start)
+            if t_f0_avail > 0:
+                f0_slice[:, :t_f0_avail] = f0[:, f0_start:f0_start + t_f0_avail]
+                n_slice[:, :t_f0_avail] = n[:, f0_start:f0_start + t_f0_avail]
+            if t_asr_avail > 0:
+                asr_slice[:, :, :t_asr_avail] = asr[:, :, asr_start:asr_start + t_asr_avail]
+            with torch.no_grad():
+                f0_up = dec.generator.f0_upsamp(torch.from_numpy(f0_slice)[:, None]).transpose(1, 2)
+                har_source, _, _ = dec.generator.m_source(f0_up)
+                har_source = har_source.transpose(1, 2).squeeze(1)
+                har_spec, har_phase = dec.generator.stft.transform(har_source)
+            inputs = {
+                'asr': asr_slice.reshape(1, 512, 1, asr_len),
+                'f0_curve': f0_slice.reshape(1, 1, 1, f0_len),
+                'n': n_slice.reshape(1, 1, 1, f0_len),
+                's': s,
+                'har_spec': har_spec.numpy().astype(np.float32).reshape(1, har_spec.shape[1], 1, har_spec.shape[2]),
+                'har_phase': har_phase.numpy().astype(np.float32).reshape(1, har_phase.shape[1], 1, har_phase.shape[2]),
+            }
+            res = model.predict(inputs)
+            key = list(res.keys())[0]
+            x = res[key]
+            with torch.no_grad():
+                n_fft = dec.generator.post_n_fft
+                x_t = torch.from_numpy(x)
+                spec_t = torch.exp(x_t[:, :n_fft//2+1, :])
+                phase_t = torch.sin(x_t[:, n_fft//2+1:, :])
+                chunk = dec.generator.stft.inverse(spec_t, phase_t).squeeze().numpy()
+            if samples_per_f0_frame is None:
+                samples_per_f0_frame = max(1, int(round(len(chunk) / float(f0_len))))
+                total_len = samples_per_f0_frame * T_f0
+                out_audio = np.zeros((total_len,), dtype=np.float32)
+                acc = np.zeros_like(out_audio)
+            dst_start = f0_start * samples_per_f0_frame
+            dst_end = dst_start + len(chunk)
+            # Boundaries safety if first/last segment shorter than chunk (due to schedule overlap rounding)
+            end_cap = min(dst_end, out_audio.shape[0])
+            cl = end_cap - dst_start
+            if cl > 0:
+                hann = np.hanning(len(chunk)).astype(np.float32)
+                out_audio[dst_start:end_cap] += (chunk[:cl] * hann[:cl])
+                acc[dst_start:end_cap] += hann[:cl]
+        if out_audio is None:
+            return None
+        valid = acc > 1e-6
+        audio = np.zeros_like(out_audio)
+        audio[valid] = out_audio[valid] / acc[valid]
+        final_len = samples_per_f0_frame * T_f0
+        return audio[:final_len]
             
         print("🍎 Running CoreML vocoder on ANE...")
         
         try:
+            # CoreML vocoder expects fixed windows; chunk instead of resample.
+            # Window sizes from export: asr=200, f0/n=400. Output per window observed ~120000 samples.
+            asr = vocoder_inputs['asr'].astype(np.float32)   # (1, 512, T_asr)
+            f0 = vocoder_inputs['f0_curve'].astype(np.float32)  # (1, T_f0)
+            n = vocoder_inputs['n'].astype(np.float32)       # (1, T_n)
+            s = vocoder_inputs['s'].astype(np.float32)       # (1, 128)
+
+            asr_win, f0_win = 200, 400
+            T_asr = asr.shape[-1]
+            T_f0 = f0.shape[-1]
+            # Keep ratio ~2x between f0 and asr as in decoder
+            # Compute number of windows by f0 length
+            hop_f0 = f0_win // 4  # 75% overlap for smoother continuity
+            hop_asr = asr_win // 4
+            num_windows = int(np.ceil((T_f0 - f0_win) / hop_f0)) + 1 if T_f0 > 0 else 0
+            # Pre-allocate overlap-add buffer (approx): each chunk ~120000 samples
+            chunk_len = 120000
+            # Map hop in f0 frames to hop in audio samples using observed samples_per_f0_frame
+            samples_per_f0_frame = chunk_len // f0_win  # 120000/400 = 300
+            hop_samples = hop_f0 * samples_per_f0_frame
+            total_len = max(chunk_len, chunk_len + (num_windows - 1) * hop_samples)
+            out_audio = np.zeros((total_len,), dtype=np.float32)
+            # Hann window for crossfade
+            hann = np.hanning(chunk_len).astype(np.float32)
+            acc = np.zeros_like(out_audio)
             start_time = time.time()
-            result = self.coreml_vocoder.predict(vocoder_inputs)
+            for w in range(num_windows):
+                f0_start = w * hop_f0
+                f0_end = f0_start + f0_win
+                asr_start = w * hop_asr
+                asr_end = asr_start + asr_win
+                # Slice with zero-padding as needed
+                f0_slice = np.zeros((1, f0_win), dtype=np.float32)
+                n_slice = np.zeros((1, f0_win), dtype=np.float32)
+                asr_slice = np.zeros((1, 512, asr_win), dtype=np.float32)
+                if f0_start < T_f0:
+                    f0_slice_len = max(0, min(f0_end, T_f0) - f0_start)
+                    if f0_slice_len > 0:
+                        f0_slice[:, :f0_slice_len] = f0[:, f0_start:f0_start+f0_slice_len]
+                if f0_start < n.shape[-1]:
+                    n_slice_len = max(0, min(f0_end, n.shape[-1]) - f0_start)
+                    if n_slice_len > 0:
+                        n_slice[:, :n_slice_len] = n[:, f0_start:f0_start+n_slice_len]
+                if asr_start < T_asr:
+                    asr_slice_len = max(0, min(asr_end, T_asr) - asr_start)
+                    if asr_slice_len > 0:
+                        asr_slice[:, :, :asr_slice_len] = asr[:, :, asr_start:asr_start+asr_slice_len]
+
+                cm_inputs = {
+                    'asr': asr_slice.reshape(1, 512, 1, asr_win),
+                    'f0_curve': f0_slice.reshape(1, 1, 1, f0_win),
+                    'n': n_slice.reshape(1, 1, 1, f0_win),
+                    's': s,
+                }
+                result = self.coreml_vocoder.predict(cm_inputs)
+                audio_key = 'waveform' if 'waveform' in result else list(result.keys())[0]
+                chunk = result[audio_key].squeeze().astype(np.float32)  # (120000,)
+                # Overlap-add with Hann crossfade
+                dst_start = w * hop_samples
+                dst_end = dst_start + chunk_len
+                if dst_end > out_audio.shape[0]:
+                    # extend buffers if underestimated
+                    extend = dst_end - out_audio.shape[0]
+                    out_audio = np.concatenate([out_audio, np.zeros((extend,), dtype=np.float32)])
+                    acc = np.concatenate([acc, np.zeros((extend,), dtype=np.float32)])
+                out_audio[dst_start:dst_end] += chunk * hann
+                acc[dst_start:dst_end] += hann
             end_time = time.time()
-            
-            # Extract audio from results
-            audio_key = list(result.keys())[0]  # Get the output key
-            audio = result[audio_key]
+            # Normalize by accumulated window to avoid gain changes
+            valid_idx = np.nonzero(acc > 1e-6)[0]
+            if valid_idx.size == 0:
+                audio = out_audio[:0]
+            else:
+                last = valid_idx.max() + 1
+                audio = out_audio[:last] / np.maximum(acc[:last], 1e-6)
             
             print(f"✅ CoreML vocoder completed in {end_time - start_time:.3f}s")
             print(f"  - Audio shape: {audio.shape}")
@@ -288,9 +773,21 @@ class HybridTTSPipeline:
         print(f"\n🎵 Synthesizing: '{text}' (voice: {voice}, speed: {speed}x)")
         
         if self.use_coreml:
-            # Try hybrid pipeline first
+            # Prefer single-shot buckets
+            audio = self.run_coreml_synth_bucket(text, voice, speed)
+            if audio is not None:
+                return audio, 24000
+            audio = self.run_coreml_decoder_har_bucket(text, voice, speed)
+            if audio is not None:
+                return audio, 24000
+            # Try exact hn-nsf CoreML path
             vocoder_inputs = self.extract_vocoder_inputs(text, voice, speed)
-            if vocoder_inputs:
+            if vocoder_inputs and getattr(self, 'coreml_decoder_har', None) is not None:
+                audio = self.run_coreml_decoder_har(vocoder_inputs)
+                if audio is not None:
+                    return audio, 24000
+            # Fallback to windowed CoreML vocoder
+            if vocoder_inputs and getattr(self, 'coreml_vocoder', None) is not None:
                 audio = self.run_coreml_vocoder(vocoder_inputs)
                 if audio is not None:
                     return audio, 24000  # Kokoro uses 24kHz
@@ -403,10 +900,13 @@ def main():
     """Main execution function for the hybrid pipeline test."""
     print("🎯 Hybrid ANE-Accelerated TTS Pipeline Test")
     print("=" * 50)
-    
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--engine', choices=['pytorch', 'coreml'], default='pytorch')
+    args = parser.parse_args()
+
     # Initialize pipeline
     try:
-        pipeline = HybridTTSPipeline()
+        pipeline = HybridTTSPipeline(force_engine=args.engine)
     except Exception as e:
         print(f"❌ Failed to initialize pipeline: {e}")
         return

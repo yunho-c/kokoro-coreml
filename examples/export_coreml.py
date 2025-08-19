@@ -162,7 +162,7 @@ def export_models(kmodel, output_dir):
             ct.TensorType(name="speed", shape=(1,), dtype=np.float32),
             ct.TensorType(name="attention_mask", shape=(1, ct.RangeDim(1, 512)), dtype=np.int32)
         ],
-        outputs=[ct.TensorType(name="pred_dur"), ct.TensorType(name="d"), ct.TensorType(name="t_en"), ct.TensorType(name="s"), ct.TensorType(name="ref_s_out")],
+        outputs=[ct.TensorType(name="pred_dur"), ct.TensorType(name="d"), ct.TensorType(name="t_en"), ct.TensorType(name="s"), ct.TensorType(name="ref_s")],
         convert_to="mlprogram",
         minimum_deployment_target=ct.target.iOS15
     )
