@@ -185,3 +185,18 @@ PY
 - Observation: `aten::angle` not supported on MPS, falls back to CPU in `istftnet.py`; mixed MPS↔CPU execution adds overhead, hurting short/medium inputs. MPS is not a net win here without removing fallbacks or moving to CoreML.
 
 - Action: Prioritize CoreML vocoder (ANE) integration; continue synthesizer bucketing; keep PyTorch on CPU (or isolate ops) to avoid MPS<->CPU ping‑pong in interim.
+
+## 9. CoreML Decoder_HAR Buckets + Latency — 2025‑08‑19
+
+- Exported Decoder_HAR bucket models at 5s/15s/30s that accept exact hn‑nsf features from PyTorch (`har_spec`, `har_phase`).
+- Implemented single‑shot and grouped bucket decoding in `test_ane_pipeline.py` with 10% overlap and Hann crossfades; inverse STFT remains in PyTorch for fidelity.
+- End‑to‑end latency on a ~23.7 s utterance (user text) — warm, averaged over 5 runs:
+  - 5s bucket: ~1.350 s total (RTF ≈ 0.057)
+  - 15s bucket: ~1.413 s total (RTF ≈ 0.060)
+  - 30s bucket: ~1.380 s total (RTF ≈ 0.058)
+- Breakdown (typical warmed share): ANE (CoreML predict) ≈ 0.25–0.31 s; CPU prep (hn‑nsf + STFT) ≈ 0.15–0.17 s; inverse STFT ≈ 0.02–0.03 s; remainder orchestration/IO/overlap ≈ 0.55–0.60 s.
+
+Key learnings:
+- Larger buckets reduce CoreML call overhead and overlap tax; 15–30 s perform similarly for ~24 s clips. 5 s is slower due to more windows and crossfades.
+- Warmup matters: once models are hot, user‑visible wait per long clip drops to ~1.3–1.4 s.
+- Keeping hn‑nsf exact in PyTorch preserves quality while we iterate on Core ML fidelity; a composite operator rebuild of `generator.m_source` remains a post‑V1 option.
