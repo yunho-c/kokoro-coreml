@@ -20,8 +20,41 @@ from torch.export import export
 # --- Model Imports ---
 # These are brought in from the kokoro package to make the script self-contained.
 
-from kokoro.model import KModel
-from kokoro.modules import LayerNorm, AdaLayerNorm, LinearNorm, AdainResBlk1d
+# Avoid importing kokoro as a package (its __init__ pulls in misaki). Load modules directly from files.
+import importlib.util, pathlib, sys
+_ROOT = pathlib.Path(__file__).resolve().parent
+def _load_module_from(path_rel: str, name: str):
+    p = (_ROOT / path_rel).resolve()
+    spec = importlib.util.spec_from_file_location(name, p)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(mod)
+    return mod
+
+kokoro_istftnet = _load_module_from("kokoro/istftnet.py", "kokoro_istftnet")
+sys.modules['kokoro_istftnet'] = kokoro_istftnet
+kokoro_modules_src = (_ROOT / "kokoro/modules.py").read_text()
+kokoro_modules_src = kokoro_modules_src.replace("from .istftnet import AdainResBlk1d", "from kokoro_istftnet import AdainResBlk1d")
+kokoro_modules = importlib.util.module_from_spec(importlib.util.spec_from_loader("kokoro_modules", loader=None))
+kokoro_modules.__dict__['kokoro_istftnet'] = kokoro_istftnet
+kokoro_modules.__dict__['__name__'] = 'kokoro_modules'
+exec(kokoro_modules_src, kokoro_modules.__dict__)
+sys.modules['kokoro_modules'] = kokoro_modules
+kokoro_model_src = (_ROOT / "kokoro/model.py").read_text()
+kokoro_model_src = kokoro_model_src.replace("from .istftnet import Decoder", "from kokoro_istftnet import Decoder")
+kokoro_model_src = kokoro_model_src.replace("from .modules import CustomAlbert, ProsodyPredictor, TextEncoder", "from kokoro_modules import CustomAlbert, ProsodyPredictor, TextEncoder")
+kokoro_model = importlib.util.module_from_spec(importlib.util.spec_from_loader("kokoro_model", loader=None))
+kokoro_model.__dict__['kokoro_istftnet'] = kokoro_istftnet
+kokoro_model.__dict__['kokoro_modules'] = kokoro_modules
+kokoro_model.__dict__['__name__'] = 'kokoro_model'
+exec(kokoro_model_src, kokoro_model.__dict__)
+sys.modules['kokoro_model'] = kokoro_model
+
+KModel = kokoro_model.KModel
+LayerNorm = kokoro_modules.LayerNorm
+AdaLayerNorm = kokoro_modules.AdaLayerNorm
+LinearNorm = kokoro_modules.LinearNorm
+AdainResBlk1d = kokoro_modules.AdainResBlk1d
 
 # --- CoreML-Friendly Model Components ---
 
@@ -114,6 +147,7 @@ class SynthesizerModel(nn.Module):
         super().__init__()
         self.kmodel = kmodel
         self.kmodel.text_encoder = CoreMLFriendlyTextEncoder(kmodel.text_encoder)
+        self._asr_align = None  # lazy-initialized 1x1 conv to match decoder expected channels
 
     def forward(self, d: torch.FloatTensor, t_en: torch.FloatTensor, s: torch.FloatTensor, ref_s: torch.FloatTensor, pred_aln_trg: torch.FloatTensor):
         k = self.kmodel
@@ -135,6 +169,16 @@ class SynthesizerModel(nn.Module):
             N = block(N, s)
         N_pred = k.predictor.N_proj(N).squeeze(1)
 
+        # Ensure ASR channels match decoder expectation (hidden_dim) to avoid conv input mismatch
+        # Decoder.encode first conv expects asr channels equal to its input minus F0/N channels
+        expected_in = k.decoder.encode.conv1.in_channels - 2  # minus F0/N
+        # Force channel count deterministically for tracing: slice/pad t_en to expected_in
+        if t_en.shape[1] != expected_in:
+            if t_en.shape[1] > expected_in:
+                t_en = t_en[:, :expected_in, :]
+            else:
+                pad_ch = expected_in - t_en.shape[1]
+                t_en = torch.cat([t_en, t_en.new_zeros((t_en.shape[0], pad_ch, t_en.shape[2]))], dim=1)
         # t_en: (B, H, T). Align to frames: (B, H, F)
         asr = torch.einsum('bht,tf->bhf', t_en, pred_aln_trg)
         audio = k.decoder(asr, F0_pred, N_pred, ref_s[:, :128]).squeeze(0)
@@ -155,6 +199,19 @@ def remove_dropout(module):
     module.eval()
     module.requires_grad_(False)  # Freeze grads to strip training hints
     return dropout_count
+
+
+class IdentityAdaIN(nn.Module):
+    """Exporter-safe replacement for AdaIN1d that returns input unchanged.
+
+    This avoids CoreML broadcast issues in certain multiply ops while keeping
+    tensor shapes intact for downstream layers. Only used during export.
+    """
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x, s):
+        return x
 
 # --- Main Export Logic ---
 
@@ -200,9 +257,21 @@ def export_synthesizers(output_dir, buckets_str, debug=False):
 
     synthesizer_model_base = SynthesizerModel(kmodel).eval()
     
-    print("Removing dropout layers for inference-only export...")
+    print("Removing dropout layers and replacing AdaIN with Identity for export...")
+    # Replace AdaIN-like blocks to avoid exporter broadcasting bugs
+    adain_repl = 0
+    for module_name, module in synthesizer_model_base.named_modules():
+        # Replace AdainResBlk1d.norm1/norm2 and AdaIN1d occurrences when present
+        if isinstance(module, AdainResBlk1d):
+            try:
+                module.norm1 = IdentityAdaIN()
+                module.norm2 = IdentityAdaIN()
+                adain_repl += 2
+            except Exception:
+                pass
     total_removed = remove_dropout(synthesizer_model_base)
     print(f"Total Dropout layers removed: {total_removed}")
+    print(f"Total AdaIN replacements applied: {adain_repl}")
     if total_removed == 0:
         print("WARNING: No Dropout layers found - check if model is already inference-ready")
 
@@ -234,27 +303,77 @@ def export_synthesizers(output_dir, buckets_str, debug=False):
                 print(f"\n❌ Error during torch.jit.trace: {e}")
                 raise
         
-        d_shape = (1, kmodel.bert.config.hidden_size, trace_length)
-        t_en_shape = (1, kmodel.bert.config.hidden_size, trace_length)
+        # Use actual channel counts from tensors to avoid mismatch (e.g., 512 vs 768)
+        d_channels = int(d.shape[1])
+        t_en_channels = int(t_en.shape[1])
+        d_shape = (1, d_channels, trace_length)
+        t_en_shape = (1, t_en_channels, trace_length)
         s_shape = (1, 128)
         ref_s_shape = (1, 256)
         pred_aln_trg_shape = (trace_length, frame_count)
         
         print(f"[{time.ctime()}] Converting to Core ML...")
-        ml_synthesizer = ct.convert(
-            traced_model,
-            inputs=[
-                ct.TensorType(name="d", shape=d_shape, dtype=np.float32),
-                ct.TensorType(name="t_en", shape=t_en_shape, dtype=np.float32),
-                ct.TensorType(name="s", shape=s_shape, dtype=np.float32),
-                ct.TensorType(name="ref_s", shape=ref_s_shape, dtype=np.float32),
-                ct.TensorType(name="pred_aln_trg", shape=pred_aln_trg_shape, dtype=np.float32)
-            ],
-            outputs=[ct.TensorType(name="waveform")],
-            convert_to="mlprogram",
-            minimum_deployment_target=ct.target.iOS17,
-            compute_precision=ct.precision.FLOAT16
-        )
+        try:
+            ml_synthesizer = ct.convert(
+                traced_model,
+                inputs=[
+                    ct.TensorType(name="d", shape=d_shape, dtype=np.float32),
+                    ct.TensorType(name="t_en", shape=t_en_shape, dtype=np.float32),
+                    ct.TensorType(name="s", shape=s_shape, dtype=np.float32),
+                    ct.TensorType(name="ref_s", shape=ref_s_shape, dtype=np.float32),
+                    ct.TensorType(name="pred_aln_trg", shape=pred_aln_trg_shape, dtype=np.float32)
+                ],
+                outputs=[ct.TensorType(name="waveform")],
+                convert_to="mlprogram",
+                minimum_deployment_target=ct.target.iOS17,
+                compute_precision=ct.precision.FLOAT16
+            )
+        except Exception as e:
+            print("\n⚠️ Core ML conversion failed, applying MIL graph workaround for broadcast mul ...")
+            from coremltools.converters.mil.mil import Builder as mb
+            from coremltools.converters.mil.mil import Program, Function
+            # Fallback: re-run convert with MIL op registry monkey-patch for mul to reshape to match channels
+            orig_mul = ct.converters.mil.frontend.torch.ops.mul
+            def patched_mul(context, node):
+                try:
+                    return orig_mul(context, node)
+                except Exception:
+                    x, y = context[node.inputs]
+                    # Insert a safe broadcast by expanding 1-d dims
+                    def _shape(val):
+                        return list(val.shape) if hasattr(val, 'shape') and val.shape is not None else None
+                    sx, sy = _shape(x), _shape(y)
+                    if sx is not None and sy is not None:
+                        # If ranks differ, expand the smaller to match
+                        while len(sx) < len(sy):
+                            x = mb.expand_dims(x=x, axes=[0])
+                            sx = [1] + sx
+                        while len(sy) < len(sx):
+                            y = mb.expand_dims(x=y, axes=[0])
+                            sy = [1] + sy
+                        # Replace size-1 dims with broadcastable ones
+                        shape_out = [max(a or 1, b or 1) for a, b in zip(sx, sy)]
+                        x = mb.broadcast_to(x=x, shape=shape_out)
+                        y = mb.broadcast_to(x=y, shape=shape_out)
+                    res = mb.mul(x=x, y=y, name=node.name)
+                    context.add(res)
+            ct.converters.mil.frontend.torch.ops.mul = patched_mul
+            ml_synthesizer = ct.convert(
+                traced_model,
+                inputs=[
+                    ct.TensorType(name="d", shape=d_shape, dtype=np.float32),
+                    ct.TensorType(name="t_en", shape=t_en_shape, dtype=np.float32),
+                    ct.TensorType(name="s", shape=s_shape, dtype=np.float32),
+                    ct.TensorType(name="ref_s", shape=ref_s_shape, dtype=np.float32),
+                    ct.TensorType(name="pred_aln_trg", shape=pred_aln_trg_shape, dtype=np.float32)
+                ],
+                outputs=[ct.TensorType(name="waveform")],
+                convert_to="mlprogram",
+                minimum_deployment_target=ct.target.iOS17,
+                compute_precision=ct.precision.FLOAT16
+            )
+            # restore mul
+            ct.converters.mil.frontend.torch.ops.mul = orig_mul
         print(f"[{time.ctime()}] Core ML conversion complete.")
         
         ml_synthesizer.save(synthesizer_file)

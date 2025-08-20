@@ -1,0 +1,7 @@
+#!/Users/mattmireles/Documents/GitHub/talktome/kokoro-coreml/.venv-coreml/bin/python3
+import sys
+from csvw.__main__ import csvw2markdown
+if __name__ == '__main__':
+    if sys.argv[0].endswith('.exe'):
+        sys.argv[0] = sys.argv[0][:-4]
+    sys.exit(csvw2markdown())

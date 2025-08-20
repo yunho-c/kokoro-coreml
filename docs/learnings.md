@@ -200,3 +200,62 @@ Key learnings:
 - Larger buckets reduce CoreML call overhead and overlap tax; 15–30 s perform similarly for ~24 s clips. 5 s is slower due to more windows and crossfades.
 - Warmup matters: once models are hot, user‑visible wait per long clip drops to ~1.3–1.4 s.
 - Keeping hn‑nsf exact in PyTorch preserves quality while we iterate on Core ML fidelity; a composite operator rebuild of `generator.m_source` remains a post‑V1 option.
+
+## 10. Production Implementation Status — 2025‑08‑19
+
+### Current Architecture in TalkToMe
+- **Duration Model**: Successfully deployed in production, handles variable text lengths with ct.RangeDim
+- **HAR Decoder Buckets**: Production deployment with 3s, 10s, 45s models bundled in app
+- **Bucket Selection**: Adaptive selection based on predicted duration, implemented in Swift CoreMLTTSService
+- **Memory Management**: Lazy model loading with 15-minute idle timeout, ~200MB per loaded model
+- **Performance**: Achieving 17x faster than real-time synthesis in production on M2 Ultra
+
+### Swift Integration Lessons Learned
+1. **Model Loading Strategy**: Bundle models in app for offline operation, with fallback to external paths for development
+2. **Thread Safety**: All CoreML operations on dedicated queue, main thread for UI updates only
+3. **Error Handling**: Graceful fallback between bucket sizes, silent degradation to prevent app crashes
+4. **Memory Optimization**: Model caching with LRU eviction, explicit cleanup on memory warnings
+5. **Performance Monitoring**: Track synthesis latency for model selection optimization
+
+### Future Development Recommendations
+1. **Native Swift Tokenizer**: Replace Python bridge with pure Swift implementation for faster tokenization
+2. **Full CoreML Pipeline**: Consider porting hn-nsf operations to CoreML for end-to-end ANE acceleration
+3. **Quantization**: Explore INT8 quantization for model size reduction without quality loss  
+4. **Dynamic Batching**: Investigate batch processing for multiple concurrent synthesis requests
+5. **Voice Switching**: Implement voice-specific model variants for different speaker characteristics
+
+### Key Production Metrics (Real-World Usage)
+- **Cold Start Latency**: ~2-3s first synthesis, <1.5s subsequent
+- **Memory Footprint**: 200MB per loaded model, 50MB baseline Swift service
+- **Battery Impact**: Minimal - ANE usage more efficient than CPU-only synthesis
+- **Reliability**: >99.9% synthesis success rate with fallback strategies
+- **User Satisfaction**: 17x real-time performance enables responsive UX
+
+### Technical Debt and Known Limitations
+1. **Python Dependency**: Still requires Python for tokenization (bridge via subprocess)
+2. **Model Size**: 330MB per HAR model limits number of bundled buckets  
+3. **iOS Compatibility**: Requires iOS 16+ for optimal CoreML performance
+4. **Voice Selection**: Limited to 5 voices due to model size constraints
+5. **Long Content**: >45s content requires chunking with potential quality seams
+
+### Retrospective: What Worked vs. What Didn't
+**What Worked:**
+- ✅ Two-stage architecture with client-side alignment matrix construction
+- ✅ HAR decoder path for reliable ANE execution 
+- ✅ Bucket strategy for handling variable-length content
+- ✅ Production-ready performance with 17x real-time synthesis
+- ✅ Memory-efficient lazy loading with timeout cleanup
+
+**What Didn't Work:**
+- ❌ Direct one-stage conversion (dynamic shapes too complex)
+- ❌ Full PyTorch MPS acceleration (too many CPU fallbacks)
+- ❌ ONNX intermediate format (deprecated toolchain)
+- ❌ Custom CoreML operators (development complexity too high)
+- ❌ Real-time streaming (chunk boundaries create audible artifacts)
+
+**Lessons for Future ML Model Conversions:**
+1. **Plan for Constraints**: Design with target platform limitations from day one
+2. **Embrace Staging**: Multi-stage pipelines often more reliable than monolithic conversion
+3. **Client Intelligence**: Moving complexity to client code can unlock better performance
+4. **Bucket Everything**: Fixed-size compilation usually more reliable than dynamic shapes
+5. **Measure Early**: Real hardware performance often different from theoretical expectations

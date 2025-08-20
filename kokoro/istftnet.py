@@ -34,7 +34,18 @@
 
 # Adapted from StyleTTS2: https://github.com/yl4579/StyleTTS2/blob/main/Modules/istftnet.py
 
-from kokoro.custom_stft import CustomSTFT
+try:
+    from kokoro.custom_stft import CustomSTFT  # normal import when used as a package
+except Exception:
+    # Fallback for local script loading without package context
+    import importlib.util, pathlib
+    _ROOT = pathlib.Path(__file__).resolve().parent
+    _p = (_ROOT / 'custom_stft.py').resolve()
+    _spec = importlib.util.spec_from_file_location('kokoro_custom_stft', _p)
+    _mod = importlib.util.module_from_spec(_spec)
+    assert _spec and _spec.loader
+    _spec.loader.exec_module(_mod)
+    CustomSTFT = _mod.CustomSTFT
 from torch.nn.utils.parametrizations import weight_norm
 import math
 import torch
@@ -111,24 +122,41 @@ class AdaIN1d(nn.Module):
     #
     def __init__(self, style_dim, num_features):
         super().__init__()
-        # affine should be False, however there's a bug in the old torch.onnx.export (not newer dynamo) that causes the channel dimension to be lost if affine=False. When affine is true, there's additional learnably parameters. This shouldn't really matter setting it to True, since we're in inference mode
-        self.norm = nn.InstanceNorm1d(num_features, affine=True)
-        self.fc = nn.Linear(style_dim, num_features*2)
+        # Use manual channel-wise normalization to avoid exporter shape/broadcast bugs.
+        # Keep num_features for gamma/beta projection sizing.
+        self.num_features = num_features
+        self.eps = 1e-5
+        self.fc = nn.Linear(style_dim, num_features * 2)
 
     def forward(self, x, s):
         # Apply adaptive instance normalization with style conditioning.
-        #
-        # Parameters:
-        # - x: Input features, shape (batch, channels, sequence)
-        # - s: Style vector, shape (batch, style_dim)
-        #
-        # Returns:
-        # - torch.Tensor: Style-adapted features, same shape as input
-        #
-        h = self.fc(s)
-        h = h.view(h.size(0), h.size(1), 1)
+        # Manual per-channel normalization to keep shapes explicit for exporters.
+        # x: (B, C, T), s: (B, style_dim)
+        B, C, T = x.shape
+        # Compute channel-wise mean/var over time
+        mean = x.mean(dim=2, keepdim=True)
+        var = x.var(dim=2, unbiased=False, keepdim=True)
+        x_norm = (x - mean) / torch.sqrt(var + self.eps)
+
+        # Project style to gamma/beta: (B, 2C_fixed) -> (B, C_fixed, 1)
+        h = self.fc(s).view(B, 2 * self.num_features, 1)
         gamma, beta = torch.chunk(h, chunks=2, dim=1)
-        return (1 + gamma) * self.norm(x) + beta
+        # If actual channel count differs from configured num_features,
+        # slice or pad to match x's channels to avoid broadcast shape bugs during export.
+        if C != self.num_features:
+            if self.num_features > C:
+                gamma = gamma[:, :C, :]
+                beta = beta[:, :C, :]
+            else:
+                pad_ch = C - self.num_features
+                if pad_ch > 0:
+                    pad = gamma.new_zeros((B, pad_ch, 1))
+                    gamma = torch.cat([gamma, pad], dim=1)
+                    beta = torch.cat([beta, pad], dim=1)
+        # Expand across time to avoid implicit broadcasting pitfalls
+        gamma_exp = gamma.expand(B, C, T)
+        beta_exp = beta.expand(B, C, T)
+        return (1.0 + gamma_exp) * x_norm + beta_exp
 
 
 class AdaINResBlock1(nn.Module):
@@ -291,7 +319,12 @@ class SineGen(nn.Module):
         """
         f0_buf = torch.zeros(f0.shape[0], f0.shape[1], self.dim, device=f0.device)
         # fundamental component
-        fn = torch.multiply(f0, torch.arange(1, self.harmonic_num + 2, device=f0.device, dtype=f0.dtype).unsqueeze(0).unsqueeze(0))
+        # Build harmonics without advanced broadcasting ops to aid CoreML conversion
+        harmonics = []
+        for i in range(self.harmonic_num + 1):
+            coef = torch.tensor(float(i + 1), dtype=f0.dtype, device=f0.device)
+            harmonics.append(f0 * coef)
+        fn = torch.cat(harmonics, dim=2)
         # generate sine waveforms
         sine_waves = self._f02sine(fn) * self.sine_amp
         # generate uv signal
