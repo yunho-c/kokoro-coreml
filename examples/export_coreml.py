@@ -61,7 +61,36 @@ import numpy as np
 from safetensors.torch import load_file
 from collections import OrderedDict
 
-from kokoro.model import KModel
+# Load kokoro model code directly to avoid importing pipeline/misaki from package __init__
+import importlib.util, pathlib, sys
+_ROOT = Path(__file__).resolve().parent.parent
+def _load_module_from(path_rel: str, name: str):
+    p = (_ROOT / path_rel).resolve()
+    spec = importlib.util.spec_from_file_location(name, p)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(mod)
+    return mod
+
+kokoro_istftnet = _load_module_from("kokoro/istftnet.py", "kokoro_istftnet_for_examples")
+sys.modules['kokoro_istftnet_for_examples'] = kokoro_istftnet
+kokoro_modules_src = (_ROOT / "kokoro/modules.py").read_text()
+kokoro_modules_src = kokoro_modules_src.replace("from .istftnet import AdainResBlk1d", "from kokoro_istftnet_for_examples import AdainResBlk1d")
+kokoro_modules = importlib.util.module_from_spec(importlib.util.spec_from_loader("kokoro_modules_for_examples", loader=None))
+kokoro_modules.__dict__['kokoro_istftnet_for_examples'] = kokoro_istftnet
+kokoro_modules.__dict__['__name__'] = 'kokoro_modules_for_examples'
+exec(kokoro_modules_src, kokoro_modules.__dict__)
+sys.modules['kokoro_modules_for_examples'] = kokoro_modules
+kokoro_model_src = (_ROOT / "kokoro/model.py").read_text()
+kokoro_model_src = kokoro_model_src.replace("from .istftnet import Decoder", "from kokoro_istftnet_for_examples import Decoder")
+kokoro_model_src = kokoro_model_src.replace("from .modules import CustomAlbert, ProsodyPredictor, TextEncoder", "from kokoro_modules_for_examples import CustomAlbert, ProsodyPredictor, TextEncoder")
+kokoro_model = importlib.util.module_from_spec(importlib.util.spec_from_loader("kokoro_model_for_examples", loader=None))
+kokoro_model.__dict__['kokoro_istftnet_for_examples'] = kokoro_istftnet
+kokoro_model.__dict__['kokoro_modules_for_examples'] = kokoro_modules
+kokoro_model.__dict__['__name__'] = 'kokoro_model_for_examples'
+exec(kokoro_model_src, kokoro_model.__dict__)
+sys.modules['kokoro_model_for_examples'] = kokoro_model
+KModel = kokoro_model.KModel
 
 # --- CoreML-Friendly Model Components ---
 # These are rewritten versions of the modules in kokoro/modules.py that avoid
@@ -72,7 +101,9 @@ from kokoro.model import KModel
 # processing, which is not supported by CoreML's static graph requirements.
 # These replacements run LSTMs on padded sequences directly with masking.
 
-from kokoro.modules import LayerNorm, AdaLayerNorm, LinearNorm, AdainResBlk1d
+# IMPORTANT: Use the same module namespace as the dynamically loaded KModel to
+# ensure isinstance checks succeed (types from different modules won't match).
+from kokoro_modules_for_examples import LayerNorm, AdaLayerNorm, LinearNorm, AdainResBlk1d
 
 class CoreMLFriendlyTextEncoder(nn.Module):
     """CoreML-compatible version of Kokoro's TextEncoder that avoids pack_padded_sequence.
@@ -237,7 +268,7 @@ class CoreMLFriendlyDurationEncoder(nn.Module):
                 x = torch.cat([x, s.permute(1, 2, 0)], axis=1)
                 # Mask padding positions
                 x.masked_fill_(masks.unsqueeze(-1).transpose(-1, -2), 0.0)
-            else:
+            elif isinstance(block, nn.LSTM):
                 # LSTM processing without pack_padded_sequence
                 x = x.transpose(-1, -2)
                 block.flatten_parameters()  # Optimize LSTM memory layout
@@ -245,6 +276,9 @@ class CoreMLFriendlyDurationEncoder(nn.Module):
                 # Apply dropout (disabled in eval mode)
                 x = nn.functional.dropout(x, p=self.dropout, training=False)
                 x = x.transpose(-1, -2)
+            else:
+                # Unknown block type; pass-through to be safe
+                pass
         
         # Final transpose to return shape: (batch, hidden_size, seq_len)
         return x.transpose(-1, -2)
@@ -337,9 +371,19 @@ class DurationModel(nn.Module):
         for the fixed-size synthesis models.
         """
         k = self.kmodel
-        
-        # Calculate actual sequence lengths and create padding mask
+
+        # Normalize ranks to expected batched shapes for internal modules
+        # Accept rank-1 inputs (T,), expand to (1, T)
+        if input_ids.dim() == 1:
+            input_ids = input_ids.unsqueeze(0)
+        if attention_mask.dim() == 1:
+            attention_mask = attention_mask.unsqueeze(0)
+        if ref_s.dim() == 1:
+            ref_s = ref_s.unsqueeze(0)
+        # Calculate actual sequence lengths (strictly positive) and create padding mask
         input_lengths = attention_mask.sum(dim=-1).to(torch.long)
+        # Clamp to avoid zero-length sequences feeding into tile/repeat ops during export
+        input_lengths = torch.clamp(input_lengths, min=1)
         text_mask = attention_mask == 0  # True for padding positions
         
         # BERT requires token_type_ids (all zeros for single sequence)
@@ -365,7 +409,11 @@ class DurationModel(nn.Module):
         # Text encoding for synthesis stage (separate from duration prediction)
         t_en = k.text_encoder(input_ids, input_lengths, text_mask)
         
-        return pred_dur, d, t_en, s, ref_s
+        # Note: Do not expose ref_s as an output of the exported CoreML model.
+        # If needed during export for synthesizer tracing, compute a non-aliased
+        # version locally in Python as (ref_s + 0). Returning only the required
+        # four tensors prevents BNNS aliasing issues in Core ML.
+        return pred_dur, d, t_en, s
 
 class SynthesizerModel(nn.Module):
     """Second-stage model for fixed-size audio synthesis with ANE optimization.
@@ -451,8 +499,11 @@ class SynthesizerModel(nn.Module):
         asr = t_en @ pred_aln_trg  # (batch, hidden, seq) @ (seq, target) -> (batch, hidden, target)
         
         # Synthesize final audio waveform using decoder (vocoder)
-        # ref_s[:, :128] extracts acoustic reference (first half of reference vector)
-        audio = k.decoder(asr, F0_pred, N_pred, ref_s[:, :128]).squeeze(0)
+        # Extract acoustic reference (first half of reference vector)
+        # Expects batched input (batch, 256) -> (batch, 128)
+        ref_s_acoustic = ref_s[:, :128]
+        
+        audio = k.decoder(asr, F0_pred, N_pred, ref_s_acoustic).squeeze(0)
         
         return audio
 
@@ -471,19 +522,25 @@ def prepare_pytorch_models(config_path, checkpoint_path):
     print("PyTorch checkpoint not found. Auto-downloading from Hugging Face…")
     return KModel(config=config_path, model=None, disable_complex=True)
 
-def export_models(kmodel, output_dir):
-    """Exports the two-stage model to Core ML using a bucketing strategy."""
+def export_models(kmodel, output_dir, duration_only=False):
+    """Exports the two-stage model to Core ML using a bucketing strategy.
+
+    Args:
+        kmodel: Loaded PyTorch Kokoro model
+        output_dir: Output directory for .mlpackage files
+        duration_only: If True, export only duration model (skip synthesizer buckets)
+    """
     
     # --- 1. Export the (dynamic) DurationModel ---
     print("\n--- Exporting Duration Model ---")
     duration_model = DurationModel(kmodel).eval()
     duration_file = os.path.join(output_dir, "kokoro_duration.mlpackage")
     
-    trace_length = 256
-    input_ids = torch.randint(0, 100, (1, trace_length), dtype=torch.int32)
-    ref_s = torch.randn(1, 256, dtype=torch.float32)
+    trace_length = 128
+    input_ids = torch.randint(0, 100, (trace_length,), dtype=torch.int32)
+    ref_s = torch.randn(256, dtype=torch.float32)
     speed = torch.tensor([1.0], dtype=torch.float32)
-    attention_mask = torch.ones(1, trace_length, dtype=torch.int32)
+    attention_mask = torch.ones(trace_length, dtype=torch.int32)
     
     with torch.no_grad():
         traced_duration_model = torch.jit.trace(duration_model, (input_ids, ref_s, speed, attention_mask))
@@ -491,29 +548,42 @@ def export_models(kmodel, output_dir):
     ml_duration_model = ct.convert(
         traced_duration_model,
         inputs=[
-            ct.TensorType(name="input_ids", shape=(1, ct.RangeDim(1, 512)), dtype=np.int32),
-            ct.TensorType(name="ref_s", shape=(1, 256), dtype=np.float32),
-            ct.TensorType(name="speed", shape=(1,), dtype=np.float32),
-            ct.TensorType(name="attention_mask", shape=(1, ct.RangeDim(1, 512)), dtype=np.int32)
+            ct.TensorType(name="input_ids",      shape=(trace_length,),                                       dtype=np.int32),
+            ct.TensorType(name="ref_s",          shape=(256,),                                                dtype=np.float32),
+            ct.TensorType(name="speed",          shape=(1,),                                                  dtype=np.float32),
+            ct.TensorType(name="attention_mask", shape=(trace_length,),                                       dtype=np.int32),
         ],
-        outputs=[ct.TensorType(name="pred_dur"), ct.TensorType(name="d"), ct.TensorType(name="t_en"), ct.TensorType(name="s"), ct.TensorType(name="ref_s")],
+        outputs=[ct.TensorType(name="pred_dur"), ct.TensorType(name="d"), ct.TensorType(name="t_en"), ct.TensorType(name="s")],
         convert_to="mlprogram",
-        minimum_deployment_target=ct.target.iOS15
+        minimum_deployment_target=ct.target.macOS12
     )
     ml_duration_model.save(duration_file)
     print(f"✅ Saved Duration Model to: {duration_file}")
 
     # --- 2. Export multiple (fixed-size) SynthesizerModels ---
+    if duration_only:
+        return
+
     print("\n--- Exporting Synthesizer Models (Bucketing) ---")
     
     with torch.no_grad():
-        _, d, t_en, s, ref_s_out = duration_model(input_ids, ref_s, speed, attention_mask)
+        # Duration model returns only the needed four tensors; compute a non-aliased
+        # ref_s_out locally for synthesizer tracing.
+        _, d, t_en, s = duration_model(input_ids, ref_s, speed, attention_mask)
+        
+        # Add batch dimension for synthesizer (expects batched inputs)
+        d = d.unsqueeze(0) if d.dim() == 2 else d  # Add batch dim if needed
+        t_en = t_en.unsqueeze(0) if t_en.dim() == 2 else t_en
+        s = s.unsqueeze(0) if s.dim() == 1 else s
+        ref_s_out = ref_s.unsqueeze(0) if ref_s.dim() == 1 else ref_s
+        ref_s_out = ref_s_out + torch.zeros_like(ref_s_out)  # Non-aliased copy
     
     buckets = {
-        "3s": 3 * 24000,
-        # "5s": 5 * 24000,
-        # "10s": 10 * 24000,
-        # "30s": 30 * 24000
+        # "3s": 3 * 24000,  # Skip 3s for now
+        "5s": 5 * 24000,
+        "10s": 10 * 24000,
+        "20s": 20 * 24000,
+        # "30s": 30 * 24000  # Skip 30s - exceeds Metal texture width
     }
 
     synthesizer_model_base = SynthesizerModel(kmodel).eval()
@@ -553,13 +623,28 @@ def export_models(kmodel, output_dir):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("Export Kokoro Model to CoreML", add_help=True)
     parser.add_argument("--output_dir", "-o", type=str, default="coreml", help="Output directory")
+    parser.add_argument("--duration_only", action="store_true", help="Export only duration model (skip synthesizers)")
     args = parser.parse_args()
     
     os.makedirs(args.output_dir, exist_ok=True)
     
-    config_path = "checkpoints/config.json"
-    checkpoint_path = "checkpoints/kokoro-v1_0.pth"
-    
+    # Resolve checkpoints relative to repo kokoro-coreml directory
+    checkpoints_dir = (_ROOT / "checkpoints")
+    config_path = str(checkpoints_dir / "config.json")
+    checkpoint_path = str(checkpoints_dir / "kokoro-v1_0.pth")
+
+    # If missing, try to source from vendor and copy into checkpoints (one-time setup)
+    if not os.path.exists(config_path) or not os.path.exists(checkpoint_path):
+        vendor_dir = (ROOT_DIR / "coreml-converter" / "vendor" / "Kokoro-82M").resolve()
+        vendor_cfg = vendor_dir / "config.json"
+        vendor_pth = vendor_dir / "kokoro-v1_0.pth"
+        if vendor_cfg.exists() and vendor_pth.exists():
+            os.makedirs(checkpoints_dir, exist_ok=True)
+            import shutil
+            shutil.copyfile(str(vendor_cfg), config_path)
+            shutil.copyfile(str(vendor_pth), checkpoint_path)
+            print(f"📦 Copied vendor Kokoro files into checkpoints: {checkpoints_dir}")
+
     kmodel = prepare_pytorch_models(config_path, checkpoint_path)
-    export_models(kmodel, args.output_dir)
+    export_models(kmodel, args.output_dir, duration_only=args.duration_only)
     print("\n\n🎉 Export complete. You're ready to ship.")
