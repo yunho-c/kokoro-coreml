@@ -738,3 +738,152 @@ Implemented end-to-end failure tracing:
 5. **Implement fallbacks**: Never let resource loading completely break critical functionality
 
 **Critical lesson:** The most dangerous failures are silent ones where the system appears functional but core functionality is broken due to missing resources or configuration.
+
+## 20. HAR vs Regular Synthesizer Architecture Mismatch — 2025‑08‑22
+
+### The Next Barrier After Vocabulary Fix
+
+**Context:** After resolving the empty vocabulary issue and achieving successful tokenization, the TTS pipeline encountered a new fundamental mismatch between model architecture and pipeline implementation.
+
+**Error Signature:**
+```
+Feature har_spec is required but not specified.
+❌ CoreML synthesis error: Feature har_spec is required but not specified.
+```
+
+### Root Cause: Model Architecture Incompatibility
+
+**The Mismatch:**
+- **Pipeline Implementation**: Duration-based synthesis (duration → alignment → synthesis)
+- **Bundled Model**: HAR decoder (`KokoroDecoder_HAR.mlpackage`) expecting pre-computed HAR features
+- **Result**: Complete incompatibility between expected and provided inputs
+
+**HAR Decoder Requirements:**
+```
+Expected HAR inputs:
+- har_spec: [1, 11, 1, 24001]    (harmonic spectrogram)
+- har_phase: [1, 11, 1, 24001]   (harmonic phase)
+- asr: [1, 512, 1, 200]          (acoustic features)
+- f0_curve: [1, 1, 1, 400]       (fundamental frequency)
+- n: [1, 1, 1, 400]              (noise component)
+```
+
+**Duration Pipeline Provides:**
+```
+Actual duration/alignment inputs:
+- d: [1, 60, 512]               (duration embeddings)
+- t_en: [1, 512, 60]            (text encoder features)
+- pred_aln_trg: [60, 200]       (alignment matrix)
+- s: [1, 128]                   (style embedding)
+- ref_s: [1, 256]               (reference style)
+```
+
+### Two Architecture Paradigms
+
+#### 1. HAR (High-quality Audio Reconstruction) Pipeline
+- **Stage 1**: Text → Duration → Alignment
+- **Stage 2**: Alignment → HAR feature generation (harmonic analysis)
+- **Stage 3**: HAR features → High-quality audio synthesis
+- **Advantages**: Higher audio quality, better harmonic reconstruction
+- **Complexity**: Requires HAR feature generation implementation
+
+#### 2. Regular Synthesizer Pipeline
+- **Stage 1**: Text → Duration → Alignment
+- **Stage 2**: Duration/Alignment features → Direct audio synthesis
+- **Advantages**: Simpler pipeline, direct integration with duration model
+- **Trade-off**: Potentially lower audio quality vs HAR approach
+
+### Export Compatibility Challenge
+
+**When attempting to export regular synthesizer model:**
+```
+RuntimeError: input.size(-1) must be equal to input_size. Expected 640, got 256
+```
+
+**The trace_length Dimension Mismatch:**
+- **Duration Model**: Exported with trace_length=256
+- **Synthesizer Model**: LSTM layers expect trace_length=640
+- **Impact**: Incompatible tensor dimensions prevent model export
+
+### Solution Architecture Analysis
+
+#### Option 1: Regular Synthesizer with Matched trace_length (Recommended)
+```bash
+# Export synthesizer with matching trace_length
+python export_synthesizers.py --buckets="5s" --trace_length=256 --output_dir ../coreml
+```
+
+**Pros:**
+- Direct compatibility with existing duration model
+- Minimal code changes required
+- Smaller memory footprint (trace_length=256)
+- Faster processing
+
+**Cons:**
+- Potentially lower audio quality vs HAR approach
+
+#### Option 2: HAR Pipeline Implementation (Complex)
+- Implement HAR feature generation in Swift pipeline
+- Keep existing HAR decoder model
+- Add harmonic analysis and spectral processing
+
+**Pros:**
+- Higher potential audio quality
+- Utilizes existing HAR decoder
+
+**Cons:**
+- Significant implementation complexity
+- Additional DSP processing requirements
+- More potential failure points
+
+#### Option 3: Consistent Large trace_length (High Memory)
+- Re-export duration model with trace_length=640
+- Export synthesizer with trace_length=640
+- Update app to handle larger tensors
+
+**Pros:**
+- More model capacity
+- Consistent large dimensions
+
+**Cons:**
+- Higher memory usage
+- Slower processing
+- Risk of memory export failures (as seen previously)
+
+### Recommended Implementation Strategy
+
+**Phase 1: Quick Win with Regular Synthesizer**
+1. Export synthesizer model with trace_length=256 (matching duration)
+2. Replace HAR model in app bundle with regular synthesizer
+3. Verify end-to-end speech synthesis
+4. Establish working baseline
+
+**Phase 2: Quality Optimization (Future)**
+1. Implement HAR feature generation if higher quality needed
+2. Compare audio quality between approaches
+3. Choose optimal architecture based on quality/complexity trade-offs
+
+### Critical Debugging Insights
+
+**Shape Contract Logging Value:**
+The comprehensive shape logging immediately revealed the architecture mismatch:
+```
+🔍 SHAPE CONTRACT CHECK:
+  Synth expects 'har_spec': shape [1, 11, 1, 24001]
+  ...
+  Provided tensors:
+    d: [1, 60, 512]
+```
+
+**Key Debugging Principle:** 
+Always log expected vs actual model inputs/outputs with full shape and dtype information. Architecture mismatches become immediately obvious rather than manifesting as cryptic runtime errors.
+
+### Lessons for Model Integration
+
+1. **Verify Model Architecture Compatibility**: Always confirm model input/output requirements match pipeline implementation before integration
+2. **Consistent trace_length Critical**: All models in pipeline must use compatible trace_length dimensions
+3. **Export Order Matters**: Export models with compatible settings, not just working individual models
+4. **Shape Contract Validation**: Implement comprehensive input validation and logging for immediate mismatch detection
+5. **Architecture Documentation**: Clearly document whether models expect HAR features vs duration/alignment features
+
+**Next Milestone:** Successfully export and integrate compatible synthesizer model to achieve actual speech synthesis.
