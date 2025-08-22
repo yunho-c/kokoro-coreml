@@ -310,7 +310,9 @@ class DurationModel(nn.Module):
         pred_dur = torch.round(duration).clamp(min=1).long()
         
         t_en = k.text_encoder(input_ids, input_lengths, text_mask)
-        return pred_dur, d, t_en, s, ref_s
+        # Avoid CoreML aliasing: ensure ref_s output is not the exact same tensor as input
+        ref_s_out = ref_s + torch.zeros_like(ref_s)
+        return pred_dur, d, t_en, s, ref_s_out
 
 class SynthesizerModel(nn.Module):
     """Second-stage model: Synthesizes audio from intermediate features."""
@@ -605,7 +607,7 @@ def prepare_pytorch_models(config_path, checkpoint_path):
         return KModel(config=config_path, disable_complex=True)
     return KModel(config=config_path, model=checkpoint_path, disable_complex=True)
 
-def export_synthesizers(output_dir, buckets_str, debug=False):
+def export_synthesizers(output_dir, buckets_str, debug=False, trace_length: int | None = None):
     """Execute the complete synthesizer export pipeline with intelligent bucketing and CoreML optimization.
 
     This function orchestrates the entire export process from PyTorch model loading through
@@ -726,9 +728,13 @@ def export_synthesizers(output_dir, buckets_str, debug=False):
     print("\n--- Preparing Intermediate Features ---")
     duration_model = DurationModel(kmodel).eval()
     
-    trace_length = CoreMLExportConstants.DEBUG_TRACE_LENGTH if debug else CoreMLExportConstants.PRODUCTION_TRACE_LENGTH
-    if debug:
-        print(f"Debug mode: Using reduced trace_length of {trace_length}")
+    # Choose trace length: explicit > debug > production
+    if trace_length is not None:
+        print(f"Using explicit trace_length override: {trace_length}")
+    else:
+        trace_length = CoreMLExportConstants.DEBUG_TRACE_LENGTH if debug else CoreMLExportConstants.PRODUCTION_TRACE_LENGTH
+        if debug:
+            print(f"Debug mode: Using reduced trace_length of {trace_length}")
     input_ids = torch.randint(0, 100, (1, trace_length), dtype=torch.int32)
     ref_s = torch.randn(1, CoreMLExportConstants.VOICE_EMBEDDING_DIM, dtype=torch.float32)
     speed = torch.tensor([1.0], dtype=torch.float32)
@@ -736,8 +742,20 @@ def export_synthesizers(output_dir, buckets_str, debug=False):
     
     with torch.no_grad():
         _, d, t_en, s, ref_s_out = duration_model(input_ids, ref_s, speed, attention_mask)
-    # Use actual temporal length from produced tensors to avoid trace mismatches
-    trace_length = int(d.shape[-1])
+    # If the produced temporal length differs from requested trace_length, align by slicing/padding.
+    produced_t = int(d.shape[-1])
+    if produced_t != trace_length:
+        print(f"Aligning duration/text features time dim from {produced_t} -> {trace_length} for export")
+        def _align_time(x, T):
+            # x shape: (B, C, t)
+            if x.shape[-1] == T:
+                return x
+            if x.shape[-1] > T:
+                return x[..., :T]
+            pad = T - x.shape[-1]
+            return torch.cat([x, x.new_zeros(x.shape[0], x.shape[1], pad)], dim=-1)
+        d = _align_time(d, trace_length)
+        t_en = _align_time(t_en, trace_length)
     
     # Define buckets
     # e.g., "3s,5s,10s"
@@ -873,10 +891,11 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", "-o", type=str, default="coreml", help="Output directory for mlpackage files.")
     parser.add_argument("--buckets", type=str, default="3s", help="Comma-separated list of bucket sizes in seconds (e.g., '3s,5s,10s').")
     parser.add_argument("--debug", action="store_true", help="Use smaller trace_length for debugging to avoid memory issues.")
+    parser.add_argument("--trace_length", type=int, default=None, help="Override trace length (tokens). Must match duration export.")
     args = parser.parse_args()
 
     try:
-        export_synthesizers(args.output_dir, args.buckets, args.debug)
+        export_synthesizers(args.output_dir, args.buckets, args.debug, trace_length=args.trace_length)
         print("\n\n🎉 Synthesizer export complete. You're ready to ship.")
     except Exception as e:
         print(f"\n❌ An error occurred during export: {e}")

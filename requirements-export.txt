@@ -1,0 +1,10 @@
+# Requirements for CoreML export
+# IMPORTANT: Use torch 2.5.0 - it's the most recent version tested with coremltools
+torch==2.5.0
+torchaudio
+coremltools==8.3.0
+numpy==1.26.4
+transformers
+huggingface_hub
+loguru
+misaki[en]>=0.9.4

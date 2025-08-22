@@ -522,7 +522,7 @@ def prepare_pytorch_models(config_path, checkpoint_path):
     print("PyTorch checkpoint not found. Auto-downloading from Hugging Face…")
     return KModel(config=config_path, model=None, disable_complex=True)
 
-def export_models(kmodel, output_dir, duration_only=False):
+def export_models(kmodel, output_dir, duration_only=False, trace_length: int = 16):
     """Exports the two-stage model to Core ML using a bucketing strategy.
 
     Args:
@@ -536,7 +536,10 @@ def export_models(kmodel, output_dir, duration_only=False):
     duration_model = DurationModel(kmodel).eval()
     duration_file = os.path.join(output_dir, "kokoro_duration.mlpackage")
     
-    trace_length = 128
+    # Use caller-provided trace length. Smaller values reduce memory use during export.
+    # Must match synthesizer export to avoid shape/rank mismatches at runtime.
+    # Typical debug value: 64. Production may use 256+ depending on memory.
+    trace_length = int(trace_length)
     input_ids = torch.randint(0, 100, (trace_length,), dtype=torch.int32)
     ref_s = torch.randn(256, dtype=torch.float32)
     speed = torch.tensor([1.0], dtype=torch.float32)
@@ -579,11 +582,9 @@ def export_models(kmodel, output_dir, duration_only=False):
         ref_s_out = ref_s_out + torch.zeros_like(ref_s_out)  # Non-aliased copy
     
     buckets = {
-        # "3s": 3 * 24000,  # Skip 3s for now
-        "5s": 5 * 24000,
-        "10s": 10 * 24000,
-        "20s": 20 * 24000,
-        # "30s": 30 * 24000  # Skip 30s - exceeds Metal texture width
+        "5s": 5 * 24000,   # 120k frames - minimum app-compatible bucket
+        # "10s": 10 * 24000,   # Enable after 5s succeeds  
+        # "20s": 20 * 24000,   # Enable after 5s succeeds
     }
 
     synthesizer_model_base = SynthesizerModel(kmodel).eval()
@@ -624,6 +625,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser("Export Kokoro Model to CoreML", add_help=True)
     parser.add_argument("--output_dir", "-o", type=str, default="coreml", help="Output directory")
     parser.add_argument("--duration_only", action="store_true", help="Export only duration model (skip synthesizers)")
+    parser.add_argument("--trace_length", type=int, default=16, help="Trace length for duration export (tokens). Must match synthesizer export.")
     args = parser.parse_args()
     
     os.makedirs(args.output_dir, exist_ok=True)
@@ -646,5 +648,5 @@ if __name__ == "__main__":
             print(f"📦 Copied vendor Kokoro files into checkpoints: {checkpoints_dir}")
 
     kmodel = prepare_pytorch_models(config_path, checkpoint_path)
-    export_models(kmodel, args.output_dir, duration_only=args.duration_only)
+    export_models(kmodel, args.output_dir, duration_only=args.duration_only, trace_length=args.trace_length)
     print("\n\n🎉 Export complete. You're ready to ship.")

@@ -30,7 +30,6 @@ Successfully implemented CoreML export for Kokoro TTS model with a two-stage app
 - Successfully exported and tested
 
 ### 🚧 Synthesizer Models (planned):
-- `kokoro_synthesizer_3s.mlpackage` - For audio up to 3 seconds
 - `kokoro_synthesizer_5s.mlpackage` - For audio up to 5 seconds  
 - `kokoro_synthesizer_10s.mlpackage` - For audio up to 10 seconds
 - `kokoro_synthesizer_30s.mlpackage` - For audio up to 30 seconds
