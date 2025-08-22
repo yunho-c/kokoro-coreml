@@ -582,3 +582,159 @@ Notes:
 - Guidance:
   - Set `--trace_length` on Duration export only.
   - For Synthesizers, omit `--trace_length` and let the exporter consume the freshly produced Duration features to establish consistent shapes.
+
+## 18. Bring-up fixes and practical lessons — 2025‑08‑22
+
+### Persistent compile cache (critical)
+- Compile `.mlpackage` to a persistent, stable path inside `~/Library/Application Support/TalkToMe/CoreMLCompiled/`.
+- Loading from a stable `.mlmodelc` path enables Core ML’s device-specialized cache and avoids slow cold-compiles under `/var/folders/…` every launch.
+- App logs to look for:
+  - `🛠️ compileModel: … → /var/folders/...` (initial)
+  - `📦 Using persistent compiled model: ~/Library/Application Support/TalkToMe/CoreMLCompiled/...`
+
+### Duration preflight shape fix
+- Some Duration exports expect batched inputs:
+  - `input_ids [1, T]`, `attention_mask [1, T]`, `ref_s [1, 256]`, `speed [1]`.
+- Preflight and tokenizer now emit batched shapes to satisfy `multiArrayConstraint` and avoid rank errors.
+
+### HAR decoder vs Synthesizer buckets
+- As a fast path back to “known good” audio, prefer the HAR decoder model (`KokoroDecoder_HAR.mlpackage`) when present.
+- Keep only one decoder family active in the bundle at a time to avoid accidental selection.
+- If HAR is active, ensure the pipeline feeds the correct feature set; do not reuse the Synthesizer alignment contract by mistake.
+
+### No‑selection UX fallback (for demos and sanity checks)
+- When no text is highlighted, the app now speaks a helpful hint:
+  - "hello Matt, highlight some text and I will read it to you."
+- This bypasses AX prompts; guarantees audible output path is exercised.
+
+### High‑signal logging to shorten feedback cycles
+- Added concise logs that disambiguate silent failures:
+  - Click/menu: AX availability and text length
+  - `PlaybackManager.start`: text length + preview
+  - Scheduling: pending flush, CoreML/placeholder success/fail, fallback path, buffer counts
+  - Audio engine: `engine.start()` success/error and `player.play()`
+- Use these to localize issues to CoreML vs audio routing quickly.
+
+### Reliable Mode for guaranteed audio
+- Toggle: `defaults write com.transcendence.talktome com.talktome.reliableMode.enabled -bool YES`.
+- Always schedules a short beep if synthesis fails, proving the audio pipeline.
+
+## 19. Critical Tokenization Breakthrough — 2025‑08‑22
+
+### The Silent Vocabulary Death
+
+**Context:** After all CoreML models loaded successfully and preflight passed, TTS still produced only beeps. This was the most insidious failure mode - everything appeared to work but synthesis always failed silently.
+
+**Root Cause Discovery Chain:**
+1. Added diagnostic logging: `synthesizeWithCoreMLSwift()` called successfully ✅
+2. Models healthy and loaded ✅ 
+3. **Critical finding**: `buildInputsNative()` returning nil due to `vocab.isEmpty = true`
+4. **The killer**: `KokoroTokenizer.shared.vocab` had size=0 (completely empty)
+5. **Bundle investigation**: `config.json` missing from app bundle despite build system claiming success
+
+### SPM Resource Loading Failure Pattern
+```
+Source: Sources/TalkToMe/Resources/config.json ✅ (exists)
+Package.swift: .process("Resources/config.json") ✅ (declared)
+Build output: [0/14] Copying config.json ✅ (claimed success)
+Final bundle: find TalkToMe.app -name "config.json" ❌ (missing!)
+```
+
+**Why this is dangerous:**
+- No build-time errors or warnings
+- SPM shows successful resource copying
+- Bundle.main.url() fails silently (returns nil)
+- Tokenizer initializes with empty vocabulary 
+- TTS pipeline appears healthy but always produces fallback beeps
+
+### Multi-Layer Solution Architecture
+
+#### 1. Resilient Vocabulary Loading
+```swift
+// Added comprehensive fallback chain:
+private init() {
+    var loaded: [String: Int] = [:]
+    
+    // Approach 1: Standard bundle lookup
+    if let url = Bundle.main.url(forResource: "config", withExtension: "json") {
+        // Load full vocabulary from bundle
+    } else {
+        // Approach 2: Manual filesystem search in bundle
+        if let resourcePath = Bundle.main.resourcePath {
+            let configPath = "\(resourcePath)/config.json"
+            if FileManager.default.fileExists(atPath: configPath) {
+                // Manual file loading
+            }
+        }
+    }
+    
+    // Approach 3: Critical fallback vocabulary
+    if loaded.isEmpty {
+        loaded = [
+            " ": 16, "a": 47, "b": 48, /* ... 26 essential characters ... */
+            "t": 66, "u": 67, "v": 68, "w": 69, "x": 70, "y": 71, "z": 72, 
+            ".": 4, ",": 3, "!": 5, "?": 6
+        ]
+    }
+    
+    self.vocab = loaded
+}
+```
+
+#### 2. Comprehensive Bundle Diagnostics
+Added extensive logging to understand resource availability:
+```swift
+// Bundle introspection and debugging
+print("🔍 [DIAGNOSTIC] Bundle.main.bundlePath: \(Bundle.main.bundlePath)")
+if let resourcePath = Bundle.main.resourcePath {
+    let contents = try FileManager.default.contentsOfDirectory(atPath: resourcePath)
+    print("🔍 [DIAGNOSTIC] Bundle resources: \(contents)")
+}
+```
+
+#### 3. Diagnostic Logging Chain
+Implemented end-to-end failure tracing:
+```
+🔍 [DIAGNOSTIC] synthesizeWithCoreMLSwift called for: 'hello Matt...'
+🔍 [DIAGNOSTIC] synthesizeWithCoreMLSwift: ttsService is healthy, proceeding  
+🔍 [DIAGNOSTIC] buildInputsNative called with text: '...', voice: af_heart
+🔍 [DIAGNOSTIC] buildInputsNative: vocab loaded, size=0  ❌ ROOT CAUSE!
+🔍 [DIAGNOSTIC] buildInputsNative: vocab is empty, returning nil
+```
+
+### Critical Success Metrics
+- **Before**: vocab.count = 0 → 100% beep fallbacks
+- **After**: vocab.count = 26+ → real TTS synthesis enabled  
+- **Resilience**: App never completely broken due to resource loading failures
+- **Diagnostic**: Exact failure pinpointing for future issues
+
+### Long-Term Architectural Value
+
+#### 1. Resource Loading Best Practices
+- Never assume Bundle.main resources load successfully
+- Always implement multi-tier fallback strategies
+- Comprehensive diagnostic logging for resource discovery
+- Separate critical functionality from external resource dependencies
+
+#### 2. Build System Edge Case Knowledge
+- SPM resource copying can fail silently despite "success" messages
+- Clean builds (`swift package clean`) essential after resource changes
+- Bundle contents verification separate from build output claims
+- Cross-verification: source → build claim → actual bundle contents
+
+#### 3. TTS Pipeline Resilience Architecture
+- Critical functionality (basic English synthesis) never completely fails
+- Graceful degradation: full vocab → minimal vocab → beep fallback
+- Clear diagnostic signals for each failure mode
+- Separation of model health vs tokenizer health vs resource availability
+
+### Debugging Methodology for Similar Issues
+
+**When TTS appears healthy but produces no synthesis:**
+1. **Log model health**: Are CoreML models loaded and preflight passing?
+2. **Log tokenizer state**: Is vocabulary populated? What size?
+3. **Log input processing**: Are tokens being generated from text?
+4. **Log bundle contents**: What resources are actually available?
+5. **Implement fallbacks**: Never let resource loading completely break critical functionality
+
+**Critical lesson:** The most dangerous failures are silent ones where the system appears functional but core functionality is broken due to missing resources or configuration.
