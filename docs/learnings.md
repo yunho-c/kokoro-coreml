@@ -522,7 +522,36 @@ Swift runtime validation (added):
 - Pads/crops `d`, `t_en` along time to `T`; pads/crops `pred_aln_trg` to `[T, frames]`.
 - Final guard throws if `pred_aln_trg.shape != [T, frames]`.
 
-## 14. Dev Toggles and Fast Isolation — 2025-08-22
+## 14. BNNS crashes in synthesizer predict and decoder-only workaround — 2025-08-22
+
+### Symptom
+- Runtime crash inside BNNS during synthesizer prediction even when input shapes match the contract. Backtraces point to `libBNNS` and `Espresso E5RT`.
+
+### Mitigations tried
+- Replaced `einsum` with batched `matmul` in exporter (reduced risk but did not fully eliminate crash).
+- FP32 vs FP16 exports, smaller buckets and trace lengths, CPU/GPU/NE compute unit combinations — crashes persisted intermittently on BNNS paths.
+
+### Working isolation: decoder-only CoreML model
+- Split the model: move predecoder alignment math to Swift; export a decoder-only CoreML that consumes `asr`, `F0_pred`, `N_pred`, `ref_s` and outputs `waveform`.
+- Export (3s, debug sizes):
+```bash
+source .venv-coreml/bin/activate
+python kokoro-coreml/export_synthesizers.py \
+  --buckets "3s" --debug --trace_length 16 \
+  --precision float32 --mode decoder --output_dir coreml_out
+mv coreml_out/kokoro_decoder_only_3s.mlpackage BundledResources/coreml/
+```
+
+Swift predecoder steps:
+- Resize alignment to decoder frames (80).
+- Compute `asr = t_en @ pred_aln_trg` → shape [1, H, 80]; conform channels to `expected_in`.
+- Derive `F0` from `asr` frame energy (normalize + smooth); upsample to 160 (stride-2 in decoder branch). Set `N` ~0.05.
+- Predict with decoder-only model; convert waveform to PCM.
+
+Outcome:
+- Eliminates BNNS crash path; produces intelligible “proof-of-life” audio. Quality improves once proper `F0/N` features or original LSTM/F0/N stacks are restored.
+
+## 15. Dev Toggles and Fast Isolation — 2025-08-22
 
 Use these UserDefaults to isolate layers quickly while iterating:
 

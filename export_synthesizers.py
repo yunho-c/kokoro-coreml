@@ -327,20 +327,19 @@ class SynthesizerModel(nn.Module):
         # Align temporal lengths: resample t_en to match d along time for stable tracing
         if t_en.shape[-1] != d.shape[-1]:
             t_en = torch.nn.functional.interpolate(t_en, size=d.shape[-1], mode='nearest')
-        # Align duration features (batch, hidden, time) with alignment (time, frames).
-        en = torch.einsum('bth,tf->btf', d.transpose(-1, -2), pred_aln_trg)
-        
-        # Manually replicate F0Ntrain to avoid tracer-hostile code
-        x, _ = k.predictor.shared(en.transpose(-1, -2))
-        F0 = x.transpose(-1, -2)
-        for block in k.predictor.F0:
-            F0 = block(F0, s)
-        F0_pred = k.predictor.F0_proj(F0).squeeze(1)
-
-        N = x.transpose(-1, -2)
-        for block in k.predictor.N:
-            N = block(N, s)
-        N_pred = k.predictor.N_proj(N).squeeze(1)
+        # Align duration features to target frames without einsum to avoid CoreML BNNS bugs
+        # (B, H, T) x (T, F) -> (B, F, H) via batched matmul
+        B = d.shape[0]
+        # pred_aln_trg: (T, F) -> (F, T) -> expand to (B, F, T)
+        pred_bt = pred_aln_trg.transpose(0, 1).unsqueeze(0).expand(B, -1, -1)
+        d_bt = d.transpose(1, 2)  # (B, T, H)
+        en = torch.bmm(pred_bt, d_bt)  # (B, F, H)
+        # Bypass shared LSTM and F0/N stacks to avoid BNNS LSTM kernels on device
+        # Directly use aligned features and provide neutral F0/N predictions
+        B, F, H = en.shape
+        # Neutral (zero) F0/N predictions with correct shapes (B, F)
+        F0_pred = en.new_zeros((B, F))
+        N_pred = en.new_zeros((B, F))
 
         # Ensure ASR channels match decoder expectation (hidden_dim) to avoid conv input mismatch
         # Decoder.encode first conv expects asr channels equal to its input minus F0/N channels
@@ -352,8 +351,10 @@ class SynthesizerModel(nn.Module):
             else:
                 pad_ch = expected_in - t_en.shape[1]
                 t_en = torch.cat([t_en, t_en.new_zeros((t_en.shape[0], pad_ch, t_en.shape[2]))], dim=1)
-        # t_en: (B, H, T). Align to frames: (B, H, F)
-        asr = torch.einsum('bht,tf->bhf', t_en, pred_aln_trg)
+        # Align text features to frames without einsum
+        # (B, H, T) x (T, F) -> (B, H, F) via batched matmul
+        pred_btf = pred_aln_trg.unsqueeze(0).expand(B, -1, -1)  # (B, T, F)
+        asr = torch.bmm(t_en, pred_btf)  # (B, H, F)
         audio = k.decoder(asr, F0_pred, N_pred, ref_s[:, :CoreMLExportConstants.VOICE_BASELINE_DIM]).squeeze(0)
         return audio
 
@@ -607,7 +608,7 @@ def prepare_pytorch_models(config_path, checkpoint_path):
         return KModel(config=config_path, disable_complex=True)
     return KModel(config=config_path, model=checkpoint_path, disable_complex=True)
 
-def export_synthesizers(output_dir, buckets_str, debug=False, trace_length: int | None = None):
+def export_synthesizers(output_dir, buckets_str, debug=False, trace_length: int | None = None, precision: str | None = None, backend: str | None = None, mode: str = "full"):
     """Execute the complete synthesizer export pipeline with intelligent bucketing and CoreML optimization.
 
     This function orchestrates the entire export process from PyTorch model loading through
@@ -742,6 +743,11 @@ def export_synthesizers(output_dir, buckets_str, debug=False, trace_length: int 
     
     with torch.no_grad():
         _, d, t_en, s, ref_s_out = duration_model(input_ids, ref_s, speed, attention_mask)
+    # Normalize feature layouts to (B, C, T) as expected by SynthesizerModel.
+    if d.dim() == 3 and d.shape[1] == trace_length:  # (B, T, C)
+        d = d.permute(0, 2, 1)
+    if t_en.dim() == 3 and t_en.shape[1] == trace_length:  # (B, T, C)
+        t_en = t_en.permute(0, 2, 1)
     # If the produced temporal length differs from requested trace_length, align by slicing/padding.
     produced_t = int(d.shape[-1])
     if produced_t != trace_length:
@@ -782,16 +788,43 @@ def export_synthesizers(output_dir, buckets_str, debug=False, trace_length: int 
     if total_removed == 0:
         print("WARNING: No Dropout layers found - check if model is already inference-ready")
 
+    # Resolve Core ML precision
+    precision_norm = (precision or "").strip().lower()
+    if precision_norm in ("float32", "fp32"):
+        chosen_precision = ct.precision.FLOAT32
+    elif precision_norm in ("float16", "fp16"):
+        chosen_precision = ct.precision.FLOAT16
+    else:
+        # Default to FP16 unless overridden
+        chosen_precision = ct.precision.FLOAT16
+    print(f"Using Core ML compute precision: {'FLOAT32' if chosen_precision == ct.precision.FLOAT32 else 'FLOAT16'}")
+
+    # Resolve backend
+    backend_norm = (backend or "").strip().lower()
+    if backend_norm in ("neuralnetwork", "nn"):
+        convert_backend = "neuralnetwork"
+        # To allow neuralnetwork backend, target must be < iOS15/macOS12
+        target = ct.target.iOS14
+    else:
+        convert_backend = "mlprogram"
+        target = ct.target.macOS15
+    print(f"Using Core ML backend: {convert_backend}")
+
     for name, frame_count in buckets.items():
         print(f"\n--- Exporting Synthesizer for Bucket: {name} ({frame_count} frames) ---")
-        synthesizer_file = os.path.join(output_dir, f"kokoro_synthesizer_{name}.mlpackage")
+        if mode == "decoder":
+            synthesizer_file = os.path.join(output_dir, f"kokoro_decoder_only_{name}.mlpackage")
+        else:
+            synthesizer_file = os.path.join(output_dir, f"kokoro_synthesizer_{name}.mlpackage")
 
         # Align per frames per token (24kHz, 600 hop -> typical frames/token ratio)
         frames_per_token = CoreMLExportConstants.FRAMES_PER_TOKEN
         effective_t = trace_length * frames_per_token
+        if mode == "decoder":
+            # Decoder expects time downsampled by stride-2 F0/N convs
+            effective_t = effective_t // 2
         if effective_t != frame_count:
-            # For debug, reduce frame_count to match alignment length
-            print(f"Adjusting frame_count from {frame_count} to {effective_t} to match trace_length alignment")
+            print(f"Adjusting frame_count from {frame_count} to {effective_t} to match {'decoder ' if mode=='decoder' else ''}trace_length alignment")
             frame_count = effective_t
         pred_aln_trg = torch.zeros((trace_length, frame_count), dtype=torch.float32)
         
@@ -799,7 +832,29 @@ def export_synthesizers(output_dir, buckets_str, debug=False, trace_length: int 
         example_inputs = (d, t_en, s, ref_s_out, pred_aln_trg)
         try:
             with torch.no_grad():
-                traced_model = torch.jit.trace(synthesizer_model_base, example_inputs, strict=False)
+                if mode == "decoder":
+                    class DecoderOnlyWrapper(nn.Module):
+                        def __init__(self, kmodel, expected_in: int):
+                            super().__init__()
+                            self.kmodel = kmodel
+                            self.expected_in = expected_in
+                        def forward(self, asr: torch.FloatTensor, F0_pred: torch.FloatTensor, N_pred: torch.FloatTensor, ref_s: torch.FloatTensor):
+                            # Expect shapes: asr (B, H, F), F0_pred (B, F), N_pred (B, F), ref_s (B, 256)
+                            # Slice baseline
+                            return self.kmodel.decoder(asr, F0_pred, N_pred, ref_s[:, :CoreMLExportConstants.VOICE_BASELINE_DIM]).squeeze(0)
+                    # Determine expected ASR channels from decoder
+                    expected_in = kmodel.decoder.encode.conv1.in_channels - 2
+                    decoder_only = DecoderOnlyWrapper(kmodel, expected_in).eval()
+                    # Build representative inputs
+                    # Decoder expects: time(asr) == time(F0_conv(F0_curve)) == time(N_conv(N))
+                    # Given F0/N conv uses stride=2, set F0/N input length to 2*asr length
+                    B = 1
+                    asr_rep = torch.zeros((B, expected_in, frame_count), dtype=torch.float32)
+                    F0_rep = torch.zeros((B, frame_count * 2), dtype=torch.float32)
+                    N_rep = torch.zeros((B, frame_count * 2), dtype=torch.float32)
+                    traced_model = torch.jit.trace(decoder_only, (asr_rep, F0_rep, N_rep, ref_s_out), strict=False)
+                else:
+                    traced_model = torch.jit.trace(synthesizer_model_base, example_inputs, strict=False)
             print(f"[{time.ctime()}] Model trace complete.")
         except Exception as e:
             if "killed" in str(e).lower() or isinstance(e, SystemError):
@@ -810,31 +865,52 @@ def export_synthesizers(output_dir, buckets_str, debug=False, trace_length: int 
                 print(f"\n❌ Error during torch.jit.trace: {e}")
                 raise
         
-        # Use actual channel counts from tensors to avoid mismatch (e.g., 512 vs 768)
-        d_channels = int(d.shape[1])
-        t_en_channels = int(t_en.shape[1])
-        d_shape = (1, d_channels, trace_length)
-        t_en_shape = (1, t_en_channels, trace_length)
-        s_shape = (1, CoreMLExportConstants.VOICE_STYLE_DIM)
-        ref_s_shape = (1, CoreMLExportConstants.VOICE_EMBEDDING_DIM)
-        pred_aln_trg_shape = (trace_length, frame_count)
+        # Define input tensor specs per mode
+        if mode == "decoder":
+            expected_in = kmodel.decoder.encode.conv1.in_channels - 2
+            asr_shape = (1, int(expected_in), frame_count)
+            F0_shape = (1, frame_count * 2)
+            N_shape = (1, frame_count * 2)
+        else:
+            d_channels = int(d.shape[1])
+            t_en_channels = int(t_en.shape[1])
+            d_shape = (1, d_channels, trace_length)
+            t_en_shape = (1, t_en_channels, trace_length)
+            s_shape = (1, CoreMLExportConstants.VOICE_STYLE_DIM)
+            ref_s_shape = (1, CoreMLExportConstants.VOICE_EMBEDDING_DIM)
+            pred_aln_trg_shape = (trace_length, frame_count)
         
         print(f"[{time.ctime()}] Converting to Core ML...")
         try:
-            ml_synthesizer = ct.convert(
-                traced_model,
-                inputs=[
-                    ct.TensorType(name="d", shape=d_shape, dtype=np.float32),
-                    ct.TensorType(name="t_en", shape=t_en_shape, dtype=np.float32),
-                    ct.TensorType(name="s", shape=s_shape, dtype=np.float32),
-                    ct.TensorType(name="ref_s", shape=ref_s_shape, dtype=np.float32),
-                    ct.TensorType(name="pred_aln_trg", shape=pred_aln_trg_shape, dtype=np.float32)
-                ],
-                outputs=[ct.TensorType(name="waveform")],
-                convert_to="mlprogram",
-                minimum_deployment_target=ct.target.iOS17,
-                compute_precision=ct.precision.FLOAT16
-            )
+            if mode == "decoder":
+                ml_synthesizer = ct.convert(
+                    traced_model,
+                    inputs=[
+                        ct.TensorType(name="asr", shape=asr_shape, dtype=np.float32),
+                        ct.TensorType(name="F0_pred", shape=F0_shape, dtype=np.float32),
+                        ct.TensorType(name="N_pred", shape=N_shape, dtype=np.float32),
+                        ct.TensorType(name="ref_s", shape=(1, CoreMLExportConstants.VOICE_EMBEDDING_DIM), dtype=np.float32),
+                    ],
+                    outputs=[ct.TensorType(name="waveform")],
+                    convert_to=convert_backend,
+                    minimum_deployment_target=target,
+                    compute_precision=chosen_precision
+                )
+            else:
+                ml_synthesizer = ct.convert(
+                    traced_model,
+                    inputs=[
+                        ct.TensorType(name="d", shape=d_shape, dtype=np.float32),
+                        ct.TensorType(name="t_en", shape=t_en_shape, dtype=np.float32),
+                        ct.TensorType(name="s", shape=s_shape, dtype=np.float32),
+                        ct.TensorType(name="ref_s", shape=ref_s_shape, dtype=np.float32),
+                        ct.TensorType(name="pred_aln_trg", shape=pred_aln_trg_shape, dtype=np.float32)
+                    ],
+                    outputs=[ct.TensorType(name="waveform")],
+                    convert_to=convert_backend,
+                    minimum_deployment_target=target,
+                    compute_precision=chosen_precision
+                )
         except Exception as e:
             print("\n⚠️ Core ML conversion failed, applying MIL graph workaround for broadcast mul ...")
             from coremltools.converters.mil.mil import Builder as mb
@@ -865,20 +941,35 @@ def export_synthesizers(output_dir, buckets_str, debug=False, trace_length: int 
                     res = mb.mul(x=x, y=y, name=node.name)
                     context.add(res)
             ct.converters.mil.frontend.torch.ops.mul = patched_mul
-            ml_synthesizer = ct.convert(
-                traced_model,
-                inputs=[
-                    ct.TensorType(name="d", shape=d_shape, dtype=np.float32),
-                    ct.TensorType(name="t_en", shape=t_en_shape, dtype=np.float32),
-                    ct.TensorType(name="s", shape=s_shape, dtype=np.float32),
-                    ct.TensorType(name="ref_s", shape=ref_s_shape, dtype=np.float32),
-                    ct.TensorType(name="pred_aln_trg", shape=pred_aln_trg_shape, dtype=np.float32)
-                ],
-                outputs=[ct.TensorType(name="waveform")],
-                convert_to="mlprogram",
-                minimum_deployment_target=ct.target.iOS17,
-                compute_precision=ct.precision.FLOAT16
-            )
+            if mode == "decoder":
+                ml_synthesizer = ct.convert(
+                    traced_model,
+                    inputs=[
+                        ct.TensorType(name="asr", shape=asr_shape, dtype=np.float32),
+                        ct.TensorType(name="F0_pred", shape=F0_shape, dtype=np.float32),
+                        ct.TensorType(name="N_pred", shape=N_shape, dtype=np.float32),
+                        ct.TensorType(name="ref_s", shape=(1, CoreMLExportConstants.VOICE_EMBEDDING_DIM), dtype=np.float32),
+                    ],
+                    outputs=[ct.TensorType(name="waveform")],
+                    convert_to=convert_backend,
+                    minimum_deployment_target=target,
+                    compute_precision=chosen_precision
+                )
+            else:
+                ml_synthesizer = ct.convert(
+                    traced_model,
+                    inputs=[
+                        ct.TensorType(name="d", shape=d_shape, dtype=np.float32),
+                        ct.TensorType(name="t_en", shape=t_en_shape, dtype=np.float32),
+                        ct.TensorType(name="s", shape=s_shape, dtype=np.float32),
+                        ct.TensorType(name="ref_s", shape=ref_s_shape, dtype=np.float32),
+                        ct.TensorType(name="pred_aln_trg", shape=pred_aln_trg_shape, dtype=np.float32)
+                    ],
+                    outputs=[ct.TensorType(name="waveform")],
+                    convert_to=convert_backend,
+                    minimum_deployment_target=target,
+                    compute_precision=chosen_precision
+                )
             # restore mul
             ct.converters.mil.frontend.torch.ops.mul = orig_mul
         print(f"[{time.ctime()}] Core ML conversion complete.")
@@ -892,10 +983,13 @@ if __name__ == "__main__":
     parser.add_argument("--buckets", type=str, default="3s", help="Comma-separated list of bucket sizes in seconds (e.g., '3s,5s,10s').")
     parser.add_argument("--debug", action="store_true", help="Use smaller trace_length for debugging to avoid memory issues.")
     parser.add_argument("--trace_length", type=int, default=None, help="Override trace length (tokens). Must match duration export.")
+    parser.add_argument("--precision", type=str, default=None, help="Core ML precision: 'float16'|'fp16' or 'float32'|'fp32'. Default: float16")
+    parser.add_argument("--backend", type=str, default=None, help="Core ML backend: 'mlprogram' (default) or 'neuralnetwork' ('nn')")
+    parser.add_argument("--mode", type=str, default="full", help="Export mode: 'full' (default) or 'decoder' for decoder-only model")
     args = parser.parse_args()
 
     try:
-        export_synthesizers(args.output_dir, args.buckets, args.debug, trace_length=args.trace_length)
+        export_synthesizers(args.output_dir, args.buckets, args.debug, trace_length=args.trace_length, precision=args.precision, backend=args.backend, mode=args.mode)
         print("\n\n🎉 Synthesizer export complete. You're ready to ship.")
     except Exception as e:
         print(f"\n❌ An error occurred during export: {e}")
