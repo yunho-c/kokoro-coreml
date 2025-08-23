@@ -337,9 +337,10 @@ class SynthesizerModel(nn.Module):
         # Bypass shared LSTM and F0/N stacks to avoid BNNS LSTM kernels on device
         # Directly use aligned features and provide neutral F0/N predictions
         B, F, H = en.shape
-        # Neutral (zero) F0/N predictions with correct shapes (B, F)
-        F0_pred = en.new_zeros((B, F))
-        N_pred = en.new_zeros((B, F))
+        # Neutral (zero) F0/N predictions. Decoder's F0/N path uses stride-2 conv,
+        # so provide length 2*F to ensure time dims match ASR after downsampling.
+        F0_pred = en.new_zeros((B, F * 2))
+        N_pred = en.new_zeros((B, F * 2))
 
         # Ensure ASR channels match decoder expectation (hidden_dim) to avoid conv input mismatch
         # Decoder.encode first conv expects asr channels equal to its input minus F0/N channels
@@ -882,6 +883,8 @@ def export_synthesizers(output_dir, buckets_str, debug=False, trace_length: int 
         
         print(f"[{time.ctime()}] Converting to Core ML...")
         try:
+            # compute_precision is only valid for mlprogram backend
+            cp_arg = None if convert_backend == "neuralnetwork" else chosen_precision
             if mode == "decoder":
                 ml_synthesizer = ct.convert(
                     traced_model,
@@ -894,7 +897,7 @@ def export_synthesizers(output_dir, buckets_str, debug=False, trace_length: int 
                     outputs=[ct.TensorType(name="waveform")],
                     convert_to=convert_backend,
                     minimum_deployment_target=target,
-                    compute_precision=chosen_precision
+                    compute_precision=cp_arg
                 )
             else:
                 ml_synthesizer = ct.convert(
@@ -909,7 +912,7 @@ def export_synthesizers(output_dir, buckets_str, debug=False, trace_length: int 
                     outputs=[ct.TensorType(name="waveform")],
                     convert_to=convert_backend,
                     minimum_deployment_target=target,
-                    compute_precision=chosen_precision
+                    compute_precision=cp_arg
                 )
         except Exception as e:
             print("\n⚠️ Core ML conversion failed, applying MIL graph workaround for broadcast mul ...")
@@ -941,6 +944,7 @@ def export_synthesizers(output_dir, buckets_str, debug=False, trace_length: int 
                     res = mb.mul(x=x, y=y, name=node.name)
                     context.add(res)
             ct.converters.mil.frontend.torch.ops.mul = patched_mul
+            cp_arg = None if convert_backend == "neuralnetwork" else chosen_precision
             if mode == "decoder":
                 ml_synthesizer = ct.convert(
                     traced_model,
@@ -953,7 +957,7 @@ def export_synthesizers(output_dir, buckets_str, debug=False, trace_length: int 
                     outputs=[ct.TensorType(name="waveform")],
                     convert_to=convert_backend,
                     minimum_deployment_target=target,
-                    compute_precision=chosen_precision
+                    compute_precision=cp_arg
                 )
             else:
                 ml_synthesizer = ct.convert(
@@ -968,7 +972,7 @@ def export_synthesizers(output_dir, buckets_str, debug=False, trace_length: int 
                     outputs=[ct.TensorType(name="waveform")],
                     convert_to=convert_backend,
                     minimum_deployment_target=target,
-                    compute_precision=chosen_precision
+                    compute_precision=cp_arg
                 )
             # restore mul
             ct.converters.mil.frontend.torch.ops.mul = orig_mul

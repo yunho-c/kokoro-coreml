@@ -551,6 +551,31 @@ Swift predecoder steps:
 Outcome:
 - Eliminates BNNS crash path; produces intelligible “proof-of-life” audio. Quality improves once proper `F0/N` features or original LSTM/F0/N stacks are restored.
 
+### Addendum (2025-08-22 evening): 5s decoder-only is still risky on BNNS
+
+- Even with decoder-only, the 5s bucket intermittently triggers BNNS crashes at runtime when selected. Logs show `targetFrames=200` and a backtrace in `libBNNS` during prediction.
+- Practical mitigations that worked during iteration:
+  - Force 3s bucket selection via an app default (`coreml.force3sDecoder = true`) and ensure the scheduler doesn’t hardcode 5s.
+  - Prefer GPU for decoder-only loads to avoid BNNS paths when possible.
+  - Temporarily remove 5s decoder-only models from the bundle to prevent selection.
+  - Keep a 3s decoder-only model as the stable baseline while improving F0/N features in Swift.
+
+### Addendum (2025-08-23): Defaults domain and compute units reality
+
+- In Debug, `CFBundleIdentifier` can be unset/ephemeral, so `defaults write <bundle-id> com.talktome.coreml.computeUnits ...` often has no effect. Symptoms: logs show `computeUnits (synth): MLComputeUnits(rawValue: 0)` no matter what you set.
+- Practical approach while iterating:
+  - Prefer GPU for decoder-only inside the loader when no explicit user override is present.
+  - Physically remove unstable buckets (5s) from the bundle; clear `~/Library/Application Support/TalkToMe/CoreMLCompiled` to prevent stale picks.
+  - Hard-lock bucket to 3s via code path that builds alignment; verify no `targetFrames=200` appears in logs.
+- Once a stable Info.plist `CFBundleIdentifier` is set, re-introduce `UserDefaults` toggles and confirm in logs that chosen `MLComputeUnits` sticks.
+
+### Addendum (2025-08-23): Tokenizer reality — phonemes, not characters
+
+- Decoder-only stability was achieved, but audio remained noisy. Root cause: using a fallback character→ID mapping instead of Kokoro’s phoneme IDs.
+- Fix: Added a dev Python tokenizer bridge that calls a tiny script (`kokoro-coreml/dev_tokenize.py`) to emit phoneme IDs via `kokoro.KPipeline`.
+- App integration: `CoreMLTTSService.buildInputsNative` prefers Python IDs when `com.talktome.dev.usePythonTokenizer = true` and both `com.talktome.dev.tokenizerScript` and `com.talktome.dev.configPath` are set.
+- Outcome: Feeding true phoneme IDs to Duration restores sane `t_en`/`d` features; decoder-only then produces intelligible speech.
+
 ## 15. Dev Toggles and Fast Isolation — 2025-08-22
 
 Use these UserDefaults to isolate layers quickly while iterating:
@@ -916,3 +941,29 @@ Always log expected vs actual model inputs/outputs with full shape and dtype inf
 5. **Architecture Documentation**: Clearly document whether models expect HAR features vs duration/alignment features
 
 **Next Milestone:** Successfully export and integrate compatible synthesizer model to achieve actual speech synthesis.
+
+## 21. 2025‑08‑23 (late): Decoder‑only tuning and diagnostics
+
+- Hardened Swift pre‑decoder F0 gating to reduce buzz/warble:
+  - threshold = median * 0.95, baseBias = 0.10, alpha = 0.50, decay = 0.97.
+- Simple prosody shaping: slight F0 boosts around short low‑energy runs (comma‑like pauses) and a gentle end‑of‑sentence dip.
+- Alignment‑weighted energy: F0 envelope now optionally gated by per‑column maxima of the resized alignment to reduce cross‑token bleed.
+- Spectrogram dumps: added CSV dumps of ASR features behind `com.talktome.coreml.dumpSpectrograms` to guide tuning.
+- Backend preference: loader now prefers `kokoro_decoder_only_3s_nn` (neuralnetwork backend) over MLProgram to avoid BNNS variance when that variant is present.
+
+Verification cues in logs:
+- `💾 Wrote spectrogram dump: .../spec_asr_bhf_*.csv`
+- `🔍 SHAPE CONTRACT CHECK: ...` remains for synth input auditing.
+
+### 2025-08-23 (late): Decoder-only 3s fixed to 80 frames; tokenizer still failing
+
+- We re-exported the decoder-only 3s with `trace_length=16` so the model expects 80 frames (and F0/N=160). This fixes the previous 1280-frame path that caused long noisy output and timeouts. Latency now ~0.9–1.5s per 3s chunk.
+- Despite correct shapes, audio remains noisy because the Python tokenizer bridge is failing and the Swift fallback character-to-id mapping is used.
+- Error signatures:
+  - `ModuleNotFoundError: loguru` (resolved by forcing venv python)
+  - `ValueError: invalid literal for int() with base 10: 'h'` → `dev_tokenize.py` sometimes receives a string from `KPipeline`, not a tensor; needs robust parsing to numeric IDs using `config.json` symbol map.
+
+Mitigations:
+- Added `com.talktome.dev.tokenizerPython` override to select the venv interpreter used by the app.
+- Next: update `dev_tokenize.py` to map phoneme strings to integer IDs consistently, or call a `KPipeline` API that returns ids directly. Once Python ids flow, Duration → Synth should produce intelligible speech.
+
