@@ -4,6 +4,125 @@ A production-ready PyTorch → CoreML conversion pipeline for [Kokoro-82M](https
 
 > **Kokoro** is an open-weight TTS model with 82 million parameters. Despite its lightweight architecture, it delivers comparable quality to larger models while being significantly faster and more cost-efficient. With Apache-licensed weights, Kokoro can be deployed anywhere from production environments to personal projects.
 
+## 🧭 What’s in this repo (macOS integration, Aug 2025)
+
+This repository contains both the Python exporters and the CoreML models used by a macOS app (TalkToMe). We converged on a simple, robust runtime architecture designed to avoid CoreML dynamic-shape pitfalls:
+
+- Two-stage pipeline (Duration → Decoder-only Synth) with fixed shapes and Swift-side alignment.
+- Duration model: fixed 128-token input/attention; outputs `d`, `t_en`, `s`, and `ref_s_out`.
+- Decoder-only synthesizer (3s bucket): fixed inputs `asr [1,512,72]`, `F0_pred [1,144]`, `N_pred [1,144]`, `ref_s [1,256]`; output `waveform [1,43200]`.
+- Swift builds alignment `pred_aln_trg [tokens, frames]`, computes `asr = t_en @ pred_aln_trg`, derives simple `F0/N` curves, normalizes channels, and calls CoreML.
+- Full synthesizer models are intentionally excluded from the app bundle to prevent E5RT dynamic-shape warnings; we prefer the decoder-only variant.
+
+Why this works: avoiding dynamic shapes and doing pre-decoder math in Swift prevents Espresso/E5RT errors like “Invalid blob shape … non_zero_0_classic_cpu - [?, 3]”.
+
+## ✅ What we implemented (summary)
+
+- Duration model exported with fixed shapes (input_ids/attention_mask: `[1,128]`).
+- Decoder-only 3s model exported with strictly static shapes; no runtime `.expand()`/data-dependent ops.
+- Swift-side shape enforcement (pad/crop) and channel normalization for decoder inputs.
+- Persistent CoreML compilation cache in Application Support; automatic recompilation on source change.
+- Developer flags to dump waveforms/spectrograms, select compute units, and prefer decoder-only.
+- Optional Python tokenizer bridge to feed real Kokoro phoneme IDs during bring-up.
+
+## 🏗️ End‑to‑end flow (macOS)
+
+1) Tokenization
+- Preferred: Python bridge (`kokoro-coreml/dev_tokenize.py`) returns true Kokoro phoneme IDs via `KPipeline`. The script now prints pure JSON on stdout (warnings redirected to stderr) so the app can parse it reliably.
+- Fallback: lightweight Swift normalizer maps characters to IDs using `checkpoints/config.json` vocab; usable, but can produce noisy audio.
+
+2) Duration (CoreML)
+- Inputs: `input_ids [1,128] (int32)`, `attention_mask [1,128] (int32)`, `ref_s [1,256] (float32)`, `speed [1] (float32)`.
+- Outputs: `pred_dur`, `d`, `t_en`, `s`, `ref_s_out` (all float32). We use `pred_dur` to build the alignment matrix in Swift.
+
+3) Alignment (Swift)
+- Build `pred_aln_trg [tokens, frames]` with contiguous per-token spans whose total equals the requested bucket (e.g., 3s → 72 frames at 24kHz with 40 fps text features; we use 72 here for the decoder’s ASR time).
+
+4) Decoder‑only Synth (CoreML)
+- Shapes enforced before predict:
+  - `asr [1,512,72]` (from `t_en @ pred_aln_trg`, channel-padded/cropped, per-channel min-max normalized)
+  - `F0_pred [1,144]`, `N_pred [1,144]` (2× ASR time)
+  - `ref_s [1,256]` (baseline voice embedding; the decoder slices first 128 dims internally)
+- Output: `waveform [1,43200]` for 3s at 24 kHz. We convert to PCM and play.
+
+5) Audio I/O
+- Playback is 24 kHz mono. A developer flag can save the synthesized PCM to WAV for analysis.
+
+## 🔑 Developer flags (UserDefaults)
+
+Core model/runtime:
+- `com.talktome.coreml.preferDecoderOnly` (Bool, default true): prefer decoder-only models.
+- `com.talktome.coreml.no5sDecoder` (Bool, default true): avoid 5s decoder-only during bring-up.
+- `com.talktome.coreml.computeUnits` (String): one of `all|cpuAndNeuralEngine|cpuAndGPU|cpuOnly`. Decoder-only defaults to `cpuAndGPU` unless explicitly overridden.
+- `com.talktome.coreml.dumpSpectrograms` (Bool): dump CSV spectrograms for ASR features.
+- `com.talktome.coreml.dumpWaveforms` (Bool): write synthesized WAVs to the system temp directory.
+
+Tokenizer bridge:
+- `com.talktome.dev.usePythonTokenizer` (Bool): prefer Python tokenizer when enabled.
+- `com.talktome.dev.tokenizerScript` (String): absolute path to `dev_tokenize.py`.
+- `com.talktome.dev.configPath` (String): absolute path to `checkpoints/config.json`.
+- `com.talktome.dev.tokenizerPython` (String): absolute path to Python interpreter (venv) to run the script.
+
+Other dev toggles in the app (for audio fallbacks/UI) exist but are not needed for CoreML bring-up.
+
+### Example setup (macOS)
+
+```bash
+# Prefer decoder-only; avoid 5s; target CPU+GPU for decoder-only
+defaults write com.transcendence.talktome com.talktome.coreml.preferDecoderOnly -bool YES
+defaults write com.transcendence.talktome com.talktome.coreml.no5sDecoder -bool YES
+defaults write com.transcendence.talktome com.talktome.coreml.computeUnits -string cpuandgpu
+
+# Enable WAV dumps for analysis
+defaults write com.transcendence.talktome com.talktome.coreml.dumpWaveforms -bool YES
+
+# Enable Python tokenizer bridge
+defaults write com.transcendence.talktome com.talktome.dev.tokenizerPython -string "$HOME/Documents/GitHub/talktome/.venv-coreml/bin/python"
+defaults write com.transcendence.talktome com.talktome.dev.tokenizerScript -string "$HOME/Documents/GitHub/talktome/kokoro-coreml/dev_tokenize.py"
+defaults write com.transcendence.talktome com.talktome.dev.configPath      -string "$HOME/Documents/GitHub/talktome/kokoro-coreml/checkpoints/config.json"
+defaults write com.transcendence.talktome com.talktome.dev.usePythonTokenizer -bool YES
+```
+
+Note: In Debug, some apps use an ephemeral bundle id; mirror the same defaults to `com.Transcendence.talktome` if needed.
+
+## 🧪 Exported model shapes (current)
+
+- Duration: fixed token length 128; attention mask 128; `ref_s` 256; `speed` scalar.
+- Decoder-only 3s: `asr [1,512,72]`, `F0_pred [1,144]`, `N_pred [1,144]`, `ref_s [1,256]`; `waveform [1,43200]`.
+
+## 🔍 Troubleshooting guide
+
+Symptoms and fixes:
+
+- E5RT warnings about dynamic shapes (non_zero_0_classic_cpu …): remove full synthesizer models from the bundle and use decoder-only fixed-shape model; clear `~/Library/Application Support/TalkToMe/CoreMLCompiled` and Xcode DerivedData.
+- Beep-only output: “Reliable Mode” or “simpleMode” may be enabled; disable those and ensure CoreML path is taken.
+- Noise output: typically caused by character IDs instead of phoneme IDs, or all‑zero `ref_s`. Enable the Python tokenizer bridge and provide a real `config.json`. Consider wiring real voice embeddings into `ref_s`.
+- No audio: verify `waveform [1,43200]` is returned and `makePCMBuffer` is fed with correct sample rate. A fallback infers rate as `waveform.count / seconds` when converting to PCM.
+
+## 🧰 How to get WAVs for analysis
+
+1) Enable dumps: `defaults write com.transcendence.talktome com.talktome.coreml.dumpWaveforms -bool YES`
+2) Run a short TTS. The app prints: `💾 Wrote waveform dump: /var/folders/.../tts_3s_YYYYMMDD_HHMMSS_SSS.wav`.
+3) Open or copy the path to Desktop for inspection (Audacity, Python, etc.).
+
+## 📦 Files of interest
+
+- `coreml/kokoro_duration.mlpackage` – fixed-input duration model
+- `coreml/kokoro_decoder_only_3s.mlpackage` – fixed-shape decoder-only synthesizer
+- `dev_tokenize.py` – Python tokenizer bridge (now prints pure JSON ids)
+- `docs/learnings.md` – running log of issues and mitigations (E5RT, BNNS, shapes)
+
+## 🧠 Design rationale (why decoder‑only)
+
+CoreML’s E5 runtime is sensitive to dynamic/data-dependent operations. By doing alignment, simple F0/N derivation, and shape enforcement in Swift—and compiling a small, static decoder—we:
+
+- Avoid dynamic‑shape MIL graphs.
+- Keep CoreML predict calls fast and robust.
+- Retain quality headroom via better tokenization and voice embeddings.
+
+This is the “simplest thing that works”: small, understandable components with explicit shapes. It trades a little flexibility for a lot of stability on Apple’s stack.
+
+
 ## 🎯 Key Achievements
 
 - ✅ **Successfully exported Kokoro-82M to CoreML** with a novel two-stage architecture

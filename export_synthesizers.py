@@ -805,10 +805,10 @@ def export_synthesizers(output_dir, buckets_str, debug=False, trace_length: int 
     if backend_norm in ("neuralnetwork", "nn"):
         convert_backend = "neuralnetwork"
         # To allow neuralnetwork backend, target must be < iOS15/macOS12
-        target = ct.target.iOS14
+        target = ct.target.macOS11
     else:
         convert_backend = "mlprogram"
-        target = ct.target.macOS15
+        target = ct.target.macOS13
     print(f"Using Core ML backend: {convert_backend}")
 
     for name, frame_count in buckets.items():

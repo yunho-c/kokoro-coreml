@@ -615,7 +615,7 @@ def export_models(kmodel, output_dir, duration_only=False, trace_length: int = 1
             ],
             outputs=[ct.TensorType(name="waveform")],
             convert_to="mlprogram",
-            minimum_deployment_target=ct.target.iOS15
+            minimum_deployment_target=ct.target.macOS13
         )
         ml_synthesizer_model.save(synthesizer_file)
         print(f"✅ Saved Synthesizer Model to: {synthesizer_file}")

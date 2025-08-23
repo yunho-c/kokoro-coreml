@@ -169,3 +169,7 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Local TTS debug outputs (WAV/CSV/JSON)
+outputs/
+outputs/**
