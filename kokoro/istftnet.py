@@ -280,10 +280,20 @@ class SineGen(nn.Module):
         rad_values[:, 0, :] = rad_values[:, 0, :] + rand_ini
         # instantanouse phase sine[t] = sin(2*pi \sum_i=1 ^{t} rad)
         if not self.flag_for_pulse:
-            rad_values = F.interpolate(rad_values.transpose(1, 2), scale_factor=1/self.upsample_scale, mode="linear").transpose(1, 2)
-            phase = torch.cumsum(rad_values, dim=1) * 2 * torch.pi
-            phase = F.interpolate(phase.transpose(1, 2) * self.upsample_scale, scale_factor=self.upsample_scale, mode="linear").transpose(1, 2)
-            sines = torch.sin(phase)
+            # Avoid zero-length downsampling when scale_factor < 1 by using explicit sizes
+            # target length after downsample must be at least 1
+            B, L, D = rad_values.shape
+            down_len = max(1, int((L + self.upsample_scale - 1) // self.upsample_scale))
+            # Downsample by specifying size instead of fractional scale to prevent floor-to-zero
+            rad_values_ds = F.interpolate(
+                rad_values.transpose(1, 2), size=down_len, mode="linear"
+            ).transpose(1, 2)
+            phase = torch.cumsum(rad_values_ds, dim=1) * 2 * torch.pi
+            up_len = down_len * self.upsample_scale
+            phase_up = F.interpolate(
+                (phase.transpose(1, 2) * self.upsample_scale), size=up_len, mode="linear"
+            ).transpose(1, 2)
+            sines = torch.sin(phase_up)
         else:
             # If necessary, make sure that the first time step of every
             # voiced segments is sin(pi) or cos(0)

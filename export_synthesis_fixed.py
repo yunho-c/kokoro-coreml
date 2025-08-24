@@ -161,18 +161,9 @@ def _export_bucket(kmodel: KModel, seconds: int, asr_frames: int, hop: int, out_
     # Wrap into fixed-shape bucket model
     decoder_model = FixedShapeDecoderModel(decoder, asr_channels=512, asr_frames=asr_frames).eval()
 
-    # Remove training ops and replace AdaIN with identity (export robustness)
+    # Remove training-only ops; keep AdaIN active for proper style conditioning
     remove_training_ops(decoder_model)
-    adain_count = 0
-    for name, module in decoder_model.named_modules():
-        if isinstance(module, AdainResBlk1d):
-            try:
-                module.norm1 = IdentityAdaIN()
-                module.norm2 = IdentityAdaIN()
-                adain_count += 2
-            except Exception:
-                pass
-    print(f"✓ Replaced {adain_count} AdaIN layers with identity")
+    print("✓ Kept AdaIN layers (style conditioning ON)")
 
     # Representative fixed inputs
     asr = torch.zeros(1, 512, asr_frames, dtype=torch.float32)
@@ -239,12 +230,9 @@ def main():
     else:
         kmodel = KModel(disable_complex=True)
 
-    # Buckets and their shape parameters (see header rationale)
+    # Export only 3s bucket first to isolate AdaIN impact
     buckets = {
         3: {"asr_frames": 120, "hop": 5},
-        5: {"asr_frames": 125, "hop": 8},
-        10: {"asr_frames": 125, "hop": 16},
-        20: {"asr_frames": 125, "hop": 32},
     }
 
     out_dir = _ROOT / "coreml"
