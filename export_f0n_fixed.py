@@ -60,12 +60,11 @@ class F0NFixed(nn.Module):
         self.frames = frames
 
     def forward(self, en: torch.FloatTensor, s: torch.FloatTensor):
-        # en: [B, 512, T], s: [B, 128]
-        # F0Ntrain expects x with channels = d_hid + style_dim along channel axis before its transpose
-        # Concatenate broadcasted style along channel dim: [B, 512+128, T]
-        s_bc = s.unsqueeze(-1).expand(-1, s.shape[1], en.shape[2])  # [B,128,T]
-        x = torch.cat([en, s_bc], dim=1)  # [B,640,T]
-        F0, N = self.predictor.F0Ntrain(x, s)
+        # en: [B, 640, T], s: [B, 128]
+        # ProsodyPredictor.F0Ntrain expects input with channels (d_hid) followed by style concatenation internally.
+        # The predictor's shared LSTM is configured for d_hid + style_dim = 512 + 128 = 640.
+        # So we feed [B, 640, T] directly and let F0Ntrain do its internal transposes.
+        F0, N = self.predictor.F0Ntrain(en, s)
         return F0, N
 
 
@@ -98,7 +97,7 @@ def main():
     remove_training_ops(f0n)
 
     # Representative inputs
-    en = torch.zeros(1, 512, frames, dtype=torch.float32)
+    en = torch.zeros(1, 640, frames, dtype=torch.float32)
     s = torch.zeros(1, 128, dtype=torch.float32)
 
     # Test
@@ -114,7 +113,7 @@ def main():
     mlmodel = ct.convert(
         traced,
         inputs=[
-            ct.TensorType(name="en", shape=(1, 512, frames), dtype=np.float32),
+            ct.TensorType(name="en", shape=(1, 640, frames), dtype=np.float32),
             ct.TensorType(name="s", shape=(1, 128), dtype=np.float32),
         ],
         outputs=[
