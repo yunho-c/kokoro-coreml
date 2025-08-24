@@ -1401,3 +1401,135 @@ for i in 0..<128 {
 
 **Key Insight:** The EnumeratedShapes approach successfully resolved the compilation and shape consistency issues, but the fundamental tile operation problems may require deeper PyTorch model modifications to achieve working TTS synthesis.
 
+
+## 24. Debug artifacts: WAV/CSV/IDs and structured run directories — 2025-08-23
+
+To accelerate iteration and external review, we added a robust on-disk artifact pipeline that captures, per synthesis run, the exact inputs/outputs the decoder consumed.
+
+- What we save per run:
+  - **ids.json**: Token IDs actually used (from Python tokenizer when enabled, else native mapping)
+  - **ASR spectrogram CSV**: The decoder’s acoustic features (`asr = t_en @ pred_aln_trg`), saved post pad/crop
+  - **WAV**: The synthesized waveform per chunk with deterministic naming
+
+- Directory layout and filenames:
+  - Base dir comes from `debugOutputBaseDir()` which resolves in order: user override → repo’s `kokoro-coreml/outputs/` → `~/Library/Application Support/TalkToMe/DebugOutputs/`
+  - Each synthesis call creates a unique subdirectory via `createRunOutputDir(for:)`
+  - Filenames are deterministic for chunking:
+    - `ids.json`
+    - `chunk_01of03_off00000_asr.csv`
+    - `chunk_01of03_off00000_tts_3s.wav`
+
+- Relevant defaults (UserDefaults keys):
+  - `com.talktome.coreml.outputBasePath` (string): optional absolute path override
+  - `com.talktome.coreml.dumpSpectrograms` (bool): enable CSV dumps (default: true in debug)
+  - `com.talktome.coreml.dumpWaveforms` (bool): enable WAV dumps (default: true in debug)
+
+- Git hygiene: `kokoro-coreml/outputs/**` added to both root and subdir `.gitignore` so artifacts don’t pollute commits.
+
+Log cues:
+```
+💾 Wrote spectrogram dump: …/chunk_01of03_off00000_asr.csv
+💾 Wrote waveform dump: …/chunk_01of03_off00000_tts_3s.wav
+```
+
+
+## 25. Tokenizer bridge stabilization and timeout — 2025-08-23
+
+Quality depended on feeding true Kokoro phoneme IDs, not the fallback character map. Two fixes made the Python bridge reliable:
+
+- `dev_tokenize.py` now prints only the JSON payload to stdout (`{"ids":[…]}`) and redirects all logs/warnings to stderr → robust Swift parsing.
+- Added a subprocess timeout and interpreter override in Swift:
+  - `com.talktome.dev.tokenizerTimeoutSec` (double, default 1.5)
+  - `com.talktome.dev.tokenizerPython` (string absolute path to venv python)
+  - `com.talktome.dev.usePythonTokenizer` (bool)
+
+Result: stable, fast ID emission; when the bridge misses the SLA, Swift terminates it and falls back to native mapping (with a clear log), avoiding hangs.
+
+
+## 26. ASR normalization toggle (disabled by default) — 2025-08-23
+
+Engineer review of dumps showed “washed‑out” ASR features. We introduced `com.talktome.coreml.normalizeASRChannels` (bool) and defaulted it to false. This bypasses per‑channel min‑max normalization and immediately improved audio from pure noise to “garbled speech,” indicating feature contrast was preserved. Keep this off unless we later match the exact training-time normalization.
+
+
+## 27. Sample-rate inference fix — 2025-08-23
+
+We fixed a critical audio artifact by inferring WAV sample rate from waveform length:
+
+- Decoder-only 3s output shape `[1, 43200]` implies 14.4 kHz, not 24 kHz
+- `PlaybackManager.makePCMBuffer` now computes `sampleRate = waveform.count / seconds` → eliminates pitch/tempo distortion
+
+Effect: transformed output from harsh noise to recognizably speech‑like (albeit still garbled pending better features).
+
+
+## 28. Removing full synthesizer from bundle to silence E5RT spam — 2025-08-23
+
+We observed persistent E5/Espresso dynamic‑shape warnings even when not selecting the full synthesizer. Root cause: the presence of `kokoro_synthesizer_3s.mlpackage` in the bundle triggers CoreML inspector logging at startup. Physically removing all full‑synth variants from the app bundle eliminated the misleading E5RT spam and reduced confusion while iterating decoder‑only.
+
+
+## 29. Attempted "no‑LSTM" full synthesizer: current CoreML limits — 2025-08-23
+
+We exported a “shared‑LSTM‑bypassed” full synthesizer (`kokoro_synthesizer_3s_nolstm.mlpackage`) to restore feature‑refinement layers while avoiding LSTM trouble. It loads, but CoreML emits width/dimension errors on some paths:
+
+```
+Invalid layer: Tensor dimensions N1D1C1H384000W1 are not within supported range
+Invalid layer: Tensor dimensions N1D1C1H128W76801 are not within supported range
+Error: Tensor width goes beyond limit supported (16390 > 16384)
+```
+
+Interpretation:
+- At least one internal tensor exceeds the Metal/BNNS texture width limit (≤ 16384)
+- A 76801‑wide axis appears in the graph (likely a flattened time/channel concat), and very long H=384000 surfaces on another path
+
+Next steps to pursue in the exporter:
+- Clamp or tile long axes to remain ≤ 16384; prefer staged upsampling over monolithic wide tensors
+- Re‑audit any `.view`/`reshape` that produces an excessively wide last dimension; keep time in H and keep W small
+- Consider `neuralnetwork` backend for this variant to avoid MLProgram rewrites that magnify widths
+- Re‑trace with shorter internal frame counts on the no‑LSTM graph if acceptable for 3s
+
+Until these are addressed, use decoder‑only 3s as the working baseline for evaluation.
+
+
+## 30. Current working baseline and quality state — 2025-08-23
+
+Working path:
+- Duration (fixed tokens) → alignment in Swift → decoder‑only 3s (`asr/F0/N/ref_s`) → sample‑rate‑inferred WAV
+- Python tokenizer bridge ON with timeout and venv override
+- ASR normalization OFF (default)
+
+Observed quality:
+- Output has speech cadence and prosody but remains garbled; spectrograms show blurry formants compared to golden
+
+Hypothesis:
+- Lacking the full synthesizer’s refinement layers, `t_en @ aln` features are too raw; “no‑LSTM” full synthesizer should sharpen features once width constraints are fixed
+
+Action list:
+1) Re‑export no‑LSTM 3s with width‑safe shapes (≤ 16384 on any axis), prefer `--backend nn`
+2) Keep decoder‑only 3s as control; A/B once no‑LSTM loads cleanly
+3) Continue saving WAV/CSV/IDs for each run to measure deltas
+4) If needed, revisit F0/N derivation heuristics after feature refinement is in‑model
+
+
+## 31. Tokenizer reality: prewarm + timeout, or it falls back — 2025-08-23
+
+The Python tokenizer bridge loads Torch and KPipeline; first call can be slow enough to miss short timeouts. Without it, the app falls back to a naive character→ID map and audio remains garbage regardless of model quality.
+
+- Practical fixes:
+  - Prewarm once: run `dev_tokenize.py --config … --text "hello world"` with the venv python before first synthesis.
+  - Increase first-run timeout (e.g., 12s) via `com.talktome.dev.tokenizerTimeoutSec`.
+  - Use `com.talktome.dev.tokenizerPython` to force the correct venv interpreter.
+- Confirmation signal in logs: `buildInputsNative: using Python tokenizer ids.count=…`. If absent, you are hearing fallback IDs.
+
+
+## 32. no‑LSTM output rate and resampling — 2025-08-23
+
+Observed output for 3s is `[1, 384000]` → 128 kHz. The audio engine is 24 kHz, so implicit conversion makes the result sound digital/phasey.
+
+- App change recommended: explicitly resample to 24 kHz (AVAudioConverter) before enqueueing audio to avoid implicit SRC artifacts.
+
+
+## 33. Precision and backend guidance for no‑LSTM — 2025-08-23
+
+- Prefer `compute_precision=ct.precision.FLOAT16` and `--backend nn` for no‑LSTM to reduce MLProgram/E5RT sensitivity and align with ANE’s native precision.
+- CPU‑only runs of the FP32 graph showed BNNS backtraces; avoid CPU for this model.
+- Regardless of precision/backends, exporter must clamp internal axes (≤ 16384) to avoid repeated width limit logs and undefined behavior.
+
