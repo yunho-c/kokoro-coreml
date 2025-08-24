@@ -11,9 +11,9 @@ The fundamental challenge was the model's heavy reliance on dynamic operations t
 - **`torch.repeat_interleave`**: This was the primary blocker. The model creates an alignment matrix whose shape depends on the *values* inside the predicted duration tensor. This is impossible to represent in a static graph.
 - **`pack_padded_sequence`**: The LSTMs used this for handling variable-length sequences, which is not supported by the Core ML tracer.
 
-## 2. The Solution: A Two-Stage, Bucketed Architecture
+## 2. The Solution: A Two-Stage, Bucketed Architecture (Attempt #1)
 
-A direct, one-to-one conversion was not feasible. The winning strategy was to re-architect the *inference pipeline* without changing the core model weights, splitting the model into two parts and using bucketing for the final stage.
+A direct, one-to-one conversion was not feasible. Our first major attempt to solve this was to re-architect the *inference pipeline*, splitting the model into two parts and using bucketing for the final stage.
 
 ### Stage 1: The `DurationModel` (Dynamic)
 
@@ -25,7 +25,6 @@ A direct, one-to-one conversion was not feasible. The winning strategy was to re
     - **Monkey-Patching**: We created CoreML-friendly versions of the `TextEncoder` and `DurationEncoder` in the export script. These custom modules remove the `pack_padded_sequence` calls and run the LSTMs directly on the padded tensors.
     - **BERT Buffer Removal**: We programmatically deleted the `buffered_token_type_ids` from the `AlbertModel` instance before tracing to prevent a `slice` error. The `token_type_ids` were then passed in as an input during the forward pass.
 - **Output**: A set of tensors containing the predicted durations and the hidden states needed for synthesis.
-- **Result**: A single, flexible `.mlpackage` that runs efficiently on the ANE.
 
 ### Stage 2: The `SynthesizerModel` (Fixed-Size Buckets)
 
@@ -34,27 +33,34 @@ A direct, one-to-one conversion was not feasible. The winning strategy was to re
   - We created multiple `SynthesizerModel`s, each one compiled for a **fixed-size** audio output (e.g., 3s, 5s, 10s, 30s). This is known as **bucketing**.
   - By using fixed-size inputs for the alignment matrix, we completely remove the dynamic shape problem that was blocking the conversion.
 - **Output**: A fixed-length audio waveform.
-- **Result**: A set of highly optimized `.mlpackage` files, one for each bucket, that run entirely on the ANE.
 
-## 3. The Client's Role: The Conductor
+### Outcome of the Two-Stage Approach: FAILURE
+While this approach worked in theory, it proved to be the root cause of our most critical bugs. Splitting the atomic alignment operation across two models created a fragile interface that led to tensor shape mismatches (garbled audio), performance fallbacks, and even malformed `.mlpackage` files that crashed Xcode. **This architecture is now considered deprecated.**
 
-The complexity that was removed from the model graph is now managed by the native Swift client code. The client is responsible for:
-1. Running the `DurationModel` once.
+## 3. Next Experiment: The "Decoder-Only" Single-Stage Architecture
+
+Given the failures of the two-stage pipeline, our next attempt is to radically simplify the architecture. The hypothesis is that by moving more logic to the Swift client and creating a single, simpler Core ML model, we can eliminate the problematic interface between model stages.
+
+- **CPU (Swift):** All dynamic, sequential logic will be handled in Swift. This includes predicting phoneme durations and building the alignment matrix (`pred_aln_trg`). This logic is transparent, easy to debug, and fast enough on the CPU.
+- **ANE (Core ML):** The heavy, parallelizable work of audio synthesis will be handled by a single, simple "decoder-only" Core ML model that accepts the pre-aligned features. This model will have fixed, static shapes, making it a better candidate for ANE optimization.
+
+The client's role becomes more significant, as it is now responsible for:
+1. Running the `DurationModel` logic (ported to Swift or called via a separate, stable model).
 2. Summing the predicted durations to determine the final audio length.
-3. Selecting the appropriate `SynthesizerModel` bucket.
-4. Building the alignment matrix on the CPU (a fast, simple operation).
-5. Padding the matrix to the bucket's fixed size.
-6. Calling the selected `SynthesizerModel`.
+3. Selecting the appropriate `Decoder-Only` bucket.
+4. Building the alignment matrix on the CPU.
+5. Padding the matrix and other features to the bucket's fixed size.
+6. Calling the selected `Decoder-Only` model.
 7. Trimming any padding silence from the end of the final audio buffer.
 
 ## 4. Key Takeaways
 
-- **Simpler is Better**: When faced with an impossible conversion, don't fight the tools. Redesign the *pipeline*, not the model.
-- **Divide and Conquer**: Isolate dynamic, data-dependent logic from the heavy, parallelizable math.
-- **CPU is Not the Enemy**: Offloading small, complex operations (like building the alignment matrix) to the CPU is a valid and powerful strategy that unlocks the ANE for the 99% of work that matters.
+- **When a complex pipeline fails, test a simpler one:** Our two-stage design was too complex and brittle. The next logical experiment is to test a single-stage, decoder-only model.
+- **Divide and Conquer Intelligently**: Isolate dynamic, data-dependent logic (like alignment matrix creation) from the heavy, parallelizable math (audio synthesis). The correct dividing line appears to be between the CPU and the ANE, not between two arbitrary model stages.
+- **CPU is Not the Enemy**: Offloading small, complex, but sequential operations to the CPU is a powerful strategy that can unlock the ANE for the 99% of the work that it's actually good at.
 - **Monkey-Patching is a Powerful Tool**: For stubborn models, modifying the model instance in-memory during the export process is a clean way to fix incompatible layers without forking the original library.
 - **Avoid Output Aliasing**: BNNS rejects graphs where an input tensor is also an output. If you must pass a tensor through (e.g., `ref_s`), either drop it from outputs or create a distinct buffer (`ref_s_out = ref_s + torch.zeros_like(ref_s)`).
-- **Bucketing Beats Dynamic Hell**: When a model's output is fundamentally dynamic, creating a few fixed-size versions is often the most pragmatic path to a shippable, high-performance solution.
+- **Bucketing Beats Dynamic Hell**: When a model's output is fundamentally dynamic, creating a few fixed-size versions is often the most pragmatic path to a shippable, high-performance solution. This still applies to our decoder-only model.
 
 ## 5. Export Tooling Challenges and Resolutions
 
@@ -88,7 +94,7 @@ The complexity that was removed from the model graph is now managed by the nativ
 - Symptoms: runtime loads `.../kokoro_duration.mlmodelc` and fails with `tile(reps)` and `ref_s` aliasing even after re-exporting.
 - Fixes:
   - Remove `.mlmodel` files from the bundle; keep only `.mlpackage` directories.
-  - Ensure `.mlpackage` is included in “Copy Bundle Resources”.
+  - Ensure `.mlpackage` is included in "Copy Bundle Resources".
   - Clean DerivedData and rebuild.
 
 - **Virtual Environment (Venv) Hell**: The environment setup was a major blocker. Issues included:
@@ -166,7 +172,7 @@ PY
 
 ## 8. GPU (MPS) Benchmark — 2025‑08‑18
 
-Ran a quick pass forcing PyTorch to use Apple GPU (MPS) for Kokoro’s PyTorch path.
+Ran a quick pass forcing PyTorch to use Apple GPU (MPS) for Kokoro's PyTorch path.
 
 - Command (from `kokoro-coreml/`):
 
@@ -489,7 +495,7 @@ This resolution provides a complete, battle-tested solution for memory-constrain
 
 ## 13. Shape Contract and Runtime Validation — 2025-08-22
 
-CoreML runtime error “Cannot retrieve vector from IRValue format int32” was ultimately caused by tensor shape mismatches between the Duration outputs and the Synthesizer inputs (not a dtype issue).
+CoreML runtime error "Cannot retrieve vector from IRValue format int32" was ultimately caused by tensor shape mismatches between the Duration outputs and the Synthesizer inputs (not a dtype issue).
 
 - What the synthesizer typically expects (example 10s bucket):
   - `d`: [1, 256, frames_per_bucket]
@@ -518,7 +524,7 @@ Rules for a healthy contract:
 Fix: Re‑export Duration at desired T (e.g., 64) and re‑export Synthesizers without forcing a conflicting `--trace_length` so they derive shapes from the new Duration features.
 
 Swift runtime validation (added):
-- Prints a “SHAPE CONTRACT CHECK” block before synth prediction with model constraints and provided tensor shapes.
+- Prints a "SHAPE CONTRACT CHECK" block before synth prediction with model constraints and provided tensor shapes.
 - Pads/crops `d`, `t_en` along time to `T`; pads/crops `pred_aln_trg` to `[T, frames]`.
 - Final guard throws if `pred_aln_trg.shape != [T, frames]`.
 
@@ -549,13 +555,13 @@ Swift predecoder steps:
 - Predict with decoder-only model; convert waveform to PCM.
 
 Outcome:
-- Eliminates BNNS crash path; produces intelligible “proof-of-life” audio. Quality improves once proper `F0/N` features or original LSTM/F0/N stacks are restored.
+- Eliminates BNNS crash path; produces intelligible "proof-of-life" audio. Quality improves once proper `F0/N` features or original LSTM/F0/N stacks are restored.
 
 ### Addendum (2025-08-22 evening): 5s decoder-only is still risky on BNNS
 
 - Even with decoder-only, the 5s bucket intermittently triggers BNNS crashes at runtime when selected. Logs show `targetFrames=200` and a backtrace in `libBNNS` during prediction.
 - Practical mitigations that worked during iteration:
-  - Force 3s bucket selection via an app default (`coreml.force3sDecoder = true`) and ensure the scheduler doesn’t hardcode 5s.
+  - Force 3s bucket selection via an app default (`coreml.force3sDecoder = true`) and ensure the scheduler doesn't hardcode 5s.
   - Prefer GPU for decoder-only loads to avoid BNNS paths when possible.
   - Temporarily remove 5s decoder-only models from the bundle to prevent selection.
   - Keep a 3s decoder-only model as the stable baseline while improving F0/N features in Swift.
@@ -571,7 +577,7 @@ Outcome:
 
 ### Addendum (2025-08-23): Tokenizer reality — phonemes, not characters
 
-- Decoder-only stability was achieved, but audio remained noisy. Root cause: using a fallback character→ID mapping instead of Kokoro’s phoneme IDs.
+- Decoder-only stability was achieved, but audio remained noisy. Root cause: using a fallback character→ID mapping instead of Kokoro's phoneme IDs.
 - Fix: Added a dev Python tokenizer bridge that calls a tiny script (`kokoro-coreml/dev_tokenize.py`) to emit phoneme IDs via `kokoro.KPipeline`.
 - App integration: `CoreMLTTSService.buildInputsNative` prefers Python IDs when `com.talktome.dev.usePythonTokenizer = true` and both `com.talktome.dev.tokenizerScript` and `com.talktome.dev.configPath` are set.
 - Outcome: Feeding true phoneme IDs to Duration restores sane `t_en`/`d` features; decoder-only then produces intelligible speech.
@@ -612,7 +618,7 @@ Log cues to verify:
 
 Purpose: eliminate Accessibility (AX) and Core Audio as variables while validating CoreML/model flow and UI responsiveness.
 
-- Behavior: Clicking the floating button or the menu bar “Play Selection” synthesizes the canned string "Hello world". No AX selection read is attempted; any AX observers are skipped. Audio engine can remain disabled via existing toggles.
+- Behavior: Clicking the floating button or the menu bar "Play Selection" synthesizes the canned string "Hello world". No AX selection read is attempted; any AX observers are skipped. Audio engine can remain disabled via existing toggles.
 - Enable:
   ```bash
   defaults write com.transcendence.talktome com.talktome.simpleMode.enabled -bool YES
@@ -641,7 +647,7 @@ Notes:
 
 ### Persistent compile cache (critical)
 - Compile `.mlpackage` to a persistent, stable path inside `~/Library/Application Support/TalkToMe/CoreMLCompiled/`.
-- Loading from a stable `.mlmodelc` path enables Core ML’s device-specialized cache and avoids slow cold-compiles under `/var/folders/…` every launch.
+- Loading from a stable `.mlmodelc` path enables Core ML's device-specialized cache and avoids slow cold-compiles under `/var/folders/…` every launch.
 - App logs to look for:
   - `🛠️ compileModel: … → /var/folders/...` (initial)
   - `📦 Using persistent compiled model: ~/Library/Application Support/TalkToMe/CoreMLCompiled/...`
@@ -652,7 +658,7 @@ Notes:
 - Preflight and tokenizer now emit batched shapes to satisfy `multiArrayConstraint` and avoid rank errors.
 
 ### HAR decoder vs Synthesizer buckets
-- As a fast path back to “known good” audio, prefer the HAR decoder model (`KokoroDecoder_HAR.mlpackage`) when present.
+- As a fast path back to "known good" audio, prefer the HAR decoder model (`KokoroDecoder_HAR.mlpackage`) when present.
 - Keep only one decoder family active in the bundle at a time to avoid accidental selection.
 - If HAR is active, ensure the pipeline feeds the correct feature set; do not reuse the Synthesizer alignment contract by mistake.
 
@@ -1408,11 +1414,11 @@ To accelerate iteration and external review, we added a robust on-disk artifact 
 
 - What we save per run:
   - **ids.json**: Token IDs actually used (from Python tokenizer when enabled, else native mapping)
-  - **ASR spectrogram CSV**: The decoder’s acoustic features (`asr = t_en @ pred_aln_trg`), saved post pad/crop
+  - **ASR spectrogram CSV**: The decoder's acoustic features (`asr = t_en @ pred_aln_trg`), saved post pad/crop
   - **WAV**: The synthesized waveform per chunk with deterministic naming
 
 - Directory layout and filenames:
-  - Base dir comes from `debugOutputBaseDir()` which resolves in order: user override → repo’s `kokoro-coreml/outputs/` → `~/Library/Application Support/TalkToMe/DebugOutputs/`
+  - Base dir comes from `debugOutputBaseDir()` which resolves in order: user override → repo's `kokoro-coreml/outputs/` → `~/Library/Application Support/TalkToMe/DebugOutputs/`
   - Each synthesis call creates a unique subdirectory via `createRunOutputDir(for:)`
   - Filenames are deterministic for chunking:
     - `ids.json`
@@ -1424,7 +1430,7 @@ To accelerate iteration and external review, we added a robust on-disk artifact 
   - `com.talktome.coreml.dumpSpectrograms` (bool): enable CSV dumps (default: true in debug)
   - `com.talktome.coreml.dumpWaveforms` (bool): enable WAV dumps (default: true in debug)
 
-- Git hygiene: `kokoro-coreml/outputs/**` added to both root and subdir `.gitignore` so artifacts don’t pollute commits.
+- Git hygiene: `kokoro-coreml/outputs/**` added to both root and subdir `.gitignore` so artifacts don't pollute commits.
 
 Log cues:
 ```
@@ -1448,7 +1454,7 @@ Result: stable, fast ID emission; when the bridge misses the SLA, Swift terminat
 
 ## 26. ASR normalization toggle (disabled by default) — 2025-08-23
 
-Engineer review of dumps showed “washed‑out” ASR features. We introduced `com.talktome.coreml.normalizeASRChannels` (bool) and defaulted it to false. This bypasses per‑channel min‑max normalization and immediately improved audio from pure noise to “garbled speech,” indicating feature contrast was preserved. Keep this off unless we later match the exact training-time normalization.
+Engineer review of dumps showed "washed‑out" ASR features. We introduced `com.talktome.coreml.normalizeASRChannels` (bool) and defaulted it to false. This bypasses per‑channel min‑max normalization and immediately improved audio from pure noise to "garbled speech," indicating feature contrast was preserved. Keep this off unless we later match the exact training-time normalization.
 
 
 ## 27. Sample-rate inference fix — 2025-08-23
@@ -1468,7 +1474,7 @@ We observed persistent E5/Espresso dynamic‑shape warnings even when not select
 
 ## 29. Attempted "no‑LSTM" full synthesizer: current CoreML limits — 2025-08-23
 
-We exported a “shared‑LSTM‑bypassed” full synthesizer (`kokoro_synthesizer_3s_nolstm.mlpackage`) to restore feature‑refinement layers while avoiding LSTM trouble. It loads, but CoreML emits width/dimension errors on some paths:
+We exported a "shared‑LSTM‑bypassed" full synthesizer (`kokoro_synthesizer_3s_nolstm.mlpackage`) to restore feature‑refinement layers while avoiding LSTM trouble. It loads, but CoreML emits width/dimension errors on some paths:
 
 ```
 Invalid layer: Tensor dimensions N1D1C1H384000W1 are not within supported range
@@ -1500,7 +1506,7 @@ Observed quality:
 - Output has speech cadence and prosody but remains garbled; spectrograms show blurry formants compared to golden
 
 Hypothesis:
-- Lacking the full synthesizer’s refinement layers, `t_en @ aln` features are too raw; “no‑LSTM” full synthesizer should sharpen features once width constraints are fixed
+- Lacking the full synthesizer's refinement layers, `t_en @ aln` features are too raw; "no‑LSTM" full synthesizer should sharpen features once width constraints are fixed
 
 Action list:
 1) Re‑export no‑LSTM 3s with width‑safe shapes (≤ 16384 on any axis), prefer `--backend nn`
@@ -1529,7 +1535,7 @@ Observed output for 3s is `[1, 384000]` → 128 kHz. The audio engine is 24 kHz,
 
 ## 33. Precision and backend guidance for no‑LSTM — 2025-08-23
 
-- Prefer `compute_precision=ct.precision.FLOAT16` and `--backend nn` for no‑LSTM to reduce MLProgram/E5RT sensitivity and align with ANE’s native precision.
+- Prefer `compute_precision=ct.precision.FLOAT16` and `--backend nn` for no‑LSTM to reduce MLProgram/E5RT sensitivity and align with ANE's native precision.
 - CPU‑only runs of the FP32 graph showed BNNS backtraces; avoid CPU for this model.
 - Regardless of precision/backends, exporter must clamp internal axes (≤ 16384) to avoid repeated width limit logs and undefined behavior.
 
