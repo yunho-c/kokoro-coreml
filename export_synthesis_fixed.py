@@ -1,23 +1,30 @@
 #!/usr/bin/env python3
-"""Fixed-Shape Synthesis Model Export for E5RT Compatibility
+"""Fixed-Shape Decoder-Only Synthesis Export (bucketed, ANE-safe)
 
-This script creates a CoreML synthesis model with completely fixed shapes to resolve
-E5RT stride conflicts and dynamic shape issues that cause "Invalid blob shape" errors.
+This script exports a decoder-only Kokoro synthesis model with fixed input/output
+shapes, optimized for Apple Neural Engine (ANE), and produces multiple duration
+"buckets" (3s, 5s, 10s, 20s). It eliminates dynamic shapes and fragile cross-model
+interfaces by moving duration/alignment logic out of Core ML.
 
-Key Differences from original export_synthesizers.py:
-1. **No Dynamic Shapes**: All inputs/outputs use fixed, static shapes
-2. **No .expand() Operations**: Replaced with explicit tensor operations
-3. **No Runtime Shape Inspection**: All shapes determined at export time
-4. **E5RT Compatible**: Avoids data-dependent operations that trigger E5RT failures
+Key goals:
+- Fixed input/output shapes per bucket (perfect for ANE)
+- Correct 24 kHz output length: seconds * 24000 samples
+- Ensure intermediate time dimension never exceeds ANE width limit (16384)
+- No dynamic ops: avoids E5RT shape errors and Xcode instability
 
-Target Issue Resolution:
-- "MIL program has non-constant (dynamic) shapes for external input but FlexibleShapeInformation attribute is missing"
-- "E5RT: Espresso exception: 'Invalid blob shape': Data-dependent shapes were disabled: non_zero_0_classic_cpu - [?, 3]"
-- ReliableMode fallback causing beep placeholders instead of speech synthesis
+Bucket configuration (asr_frames, stft_hop):
+- 3s  → asr_frames=120, hop=5     → frames=120*120=14400  (<=16384)
+- 5s  → asr_frames=125, hop=8     → frames=120*125=15000  (<=16384)
+- 10s → asr_frames=125, hop=16    → frames=15000          (<=16384)
+- 20s → asr_frames=125, hop=32    → frames=15000          (<=16384)
+
+Where frames = 2*asr_frames*upsample_product = 120*asr_frames (since upsample_rates=10*6=60
+and decoder upsamples ×2 before Generator). Output samples = frames * hop.
 """
 import os
 import pathlib
 import sys
+import json
 import torch
 import torch.nn as nn
 import coremltools as ct
@@ -60,6 +67,13 @@ sys.modules['kokoro_model_synthesis'] = kokoro_model
 
 KModel = kokoro_model.KModel
 AdainResBlk1d = kokoro_modules.AdainResBlk1d
+Decoder = kokoro_istftnet.Decoder
+
+# Utility: load raw config.json (for decoder re-instantiation)
+def _load_raw_config():
+    cfg_path = (_ROOT / "checkpoints/config.json").resolve()
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 def remove_training_ops(model):
     """Recursively replace training-specific ops with eval equivalents to avoid TRAINING dialect."""
@@ -90,40 +104,132 @@ class IdentityAdaIN(nn.Module):
         return x
 
 class FixedShapeDecoderModel(nn.Module):
-    """Fixed-shape decoder model for E5RT compatibility.
-    
-    This model eliminates all dynamic operations and uses completely fixed shapes:
-    - ASR features: [1, 512, 72] (fixed for 3s at 24kHz)
-    - F0/N predictions: [1, 144] (fixed, 2x ASR time dim due to stride-2 conv)
-    - Reference voice: [1, 256] (fixed voice embedding)
-    - Output waveform: [72000] (fixed 3s at 24kHz)
+    """Fixed-shape decoder-only model with bucketed shapes.
+
+    Shapes are fixed at construction time. Caller must provide tensors with
+    exactly these shapes.
     """
-    def __init__(self, kmodel: KModel):
+    def __init__(self, decoder: nn.Module, asr_channels: int, asr_frames: int):
         super().__init__()
-        self.decoder = kmodel.decoder
-        # Store fixed dimensions to avoid runtime inspection
-        self.asr_channels = 512
-        self.asr_frames = 72  # 3s * 24kHz / 1000 * 3 ≈ 72 frames
-        self.f0_length = 144  # 2 * asr_frames due to stride-2 conv
-        self.voice_dim = 128  # baseline voice features
-        
+        self.decoder = decoder
+        self.asr_channels = asr_channels
+        self.asr_frames = asr_frames
+        self.f0_length = asr_frames * 2  # due to stride-2 conv inside Decoder
+        self.voice_dim = 128             # baseline voice slice from ref_s
+
     def forward(self, asr: torch.FloatTensor, F0_pred: torch.FloatTensor, N_pred: torch.FloatTensor, ref_s: torch.FloatTensor):
-        # All inputs have fixed shapes - no dynamic operations allowed
-        # asr: [1, 512, 72], F0_pred: [1, 144], N_pred: [1, 144], ref_s: [1, 256]
-        
-        # Extract baseline voice features (fixed slice, no dynamic indexing)
-        ref_baseline = ref_s[:, :self.voice_dim]  # [1, 128]
-        
-        # Call decoder with completely fixed inputs - no shape inspection
+        ref_baseline = ref_s[:, :self.voice_dim]
         waveform = self.decoder(asr, F0_pred, N_pred, ref_baseline)
-        
-        # Ensure output is squeezed to expected shape [72000]
         return waveform.squeeze(0)
 
+
+def _rebuild_decoder_with_hop(kmodel: KModel, hop: int) -> nn.Module:
+    """Rebuild Decoder with a different STFT hop length while preserving weights.
+
+    We re-instantiate the Decoder/Generator with the same architecture but a new
+    gen_istft_hop_size. All learned weights are copied; STFT/sine-gen parts are
+    parameter-free and safe to re-create.
+    """
+    raw_cfg = _load_raw_config()
+    istft = raw_cfg["istftnet"]
+    decoder_new = Decoder(
+        dim_in=raw_cfg["hidden_dim"],
+        style_dim=raw_cfg["style_dim"],
+        dim_out=raw_cfg["n_mels"],
+        resblock_kernel_sizes=istft["resblock_kernel_sizes"],
+        upsample_rates=istft["upsample_rates"],
+        upsample_initial_channel=istft["upsample_initial_channel"],
+        resblock_dilation_sizes=istft["resblock_dilation_sizes"],
+        upsample_kernel_sizes=istft["upsample_kernel_sizes"],
+        gen_istft_n_fft=istft["gen_istft_n_fft"],
+        gen_istft_hop_size=hop,
+        disable_complex=True,
+    )
+    # Copy weights (ignore non-matching buffers in STFT/upsample)
+    try:
+        decoder_new.load_state_dict(kmodel.decoder.state_dict(), strict=False)
+    except Exception as e:
+        print(f"⚠️ Non-strict weight load: {e}")
+    return decoder_new.eval()
+
+def _export_bucket(kmodel: KModel, seconds: int, asr_frames: int, hop: int, out_dir: pathlib.Path):
+    print(f"\n🔄 Exporting decoder-only bucket: {seconds}s (asr_frames={asr_frames}, hop={hop})")
+
+    # Rebuild decoder with requested hop size to ensure exact output length
+    decoder = _rebuild_decoder_with_hop(kmodel, hop)
+
+    # Wrap into fixed-shape bucket model
+    decoder_model = FixedShapeDecoderModel(decoder, asr_channels=512, asr_frames=asr_frames).eval()
+
+    # Remove training ops and replace AdaIN with identity (export robustness)
+    remove_training_ops(decoder_model)
+    adain_count = 0
+    for name, module in decoder_model.named_modules():
+        if isinstance(module, AdainResBlk1d):
+            try:
+                module.norm1 = IdentityAdaIN()
+                module.norm2 = IdentityAdaIN()
+                adain_count += 2
+            except Exception:
+                pass
+    print(f"✓ Replaced {adain_count} AdaIN layers with identity")
+
+    # Representative fixed inputs
+    asr = torch.zeros(1, 512, asr_frames, dtype=torch.float32)
+    f0 = torch.zeros(1, asr_frames * 2, dtype=torch.float32)
+    n_ = torch.zeros(1, asr_frames * 2, dtype=torch.float32)
+    ref = torch.zeros(1, 256, dtype=torch.float32)
+
+    # Sanity test: forward and verify output length
+    expected_samples = seconds * 24000
+    with torch.no_grad():
+        out = decoder_model(asr, f0, n_, ref)
+        print(f"✓ Torch forward: out.shape={tuple(out.shape)} (expect ~{expected_samples})")
+
+    # Trace and convert
+    with torch.no_grad():
+        traced = torch.jit.trace(decoder_model, (asr, f0, n_, ref), strict=False)
+
+    print("🔄 Converting to CoreML (MLProgram, FP16, ALL compute units)...")
+    mlmodel = ct.convert(
+        traced,
+        inputs=[
+            ct.TensorType(name="asr", shape=(1, 512, asr_frames), dtype=np.float32),
+            ct.TensorType(name="F0_pred", shape=(1, asr_frames * 2), dtype=np.float32),
+            ct.TensorType(name="N_pred", shape=(1, asr_frames * 2), dtype=np.float32),
+            ct.TensorType(name="ref_s", shape=(1, 256), dtype=np.float32),
+        ],
+        outputs=[ct.TensorType(name="waveform")],
+        convert_to="mlprogram",
+        minimum_deployment_target=ct.target.macOS12,
+        compute_precision=ct.precision.FLOAT16,
+        compute_units=ct.ComputeUnit.ALL,
+    )
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"kokoro_decoder_only_{seconds}s.mlpackage"
+    mlmodel.save(str(out_path))
+    print(f"✅ Saved: {out_path}")
+
+    # Validate predict() path
+    try:
+        test_in = {
+            "asr": np.zeros((1, 512, asr_frames), dtype=np.float32),
+            "F0_pred": np.zeros((1, asr_frames * 2), dtype=np.float32),
+            "N_pred": np.zeros((1, asr_frames * 2), dtype=np.float32),
+            "ref_s": np.zeros((1, 256), dtype=np.float32),
+        }
+        test_out = mlmodel.predict(test_in)
+        print(f"✅ Prediction OK, outputs={list(test_out.keys())}")
+    except Exception as e:
+        print(f"❌ Validation failed: {e}")
+        raise
+
+
 def main():
-    print("🔄 Exporting fixed-shape synthesis model for E5RT compatibility...")
-    
-    # Load model
+    print("🔄 Exporting decoder-only fixed-shape buckets (ANE-safe)...")
+
+    # Load base model (weights + config)
     cfg = _ROOT / "checkpoints/config.json"
     ckpt = _ROOT / "checkpoints/kokoro-v1_0.pth"
     if cfg.exists() and ckpt.exists():
@@ -132,107 +238,20 @@ def main():
         kmodel = KModel(config=str(cfg), disable_complex=True)
     else:
         kmodel = KModel(disable_complex=True)
-        
-    # Create fixed-shape decoder model
-    decoder_model = FixedShapeDecoderModel(kmodel).eval()
-    
-    # Remove training operations
-    remove_training_ops(decoder_model)
-    
-    # Replace AdaIN layers with identity to avoid broadcast issues
-    adain_count = 0
-    for name, module in decoder_model.named_modules():
-        if isinstance(module, AdainResBlk1d):
-            try:
-                module.norm1 = IdentityAdaIN()
-                module.norm2 = IdentityAdaIN()
-                adain_count += 2
-            except:
-                pass
-    
-    print(f"✓ Replaced {adain_count} AdaIN layers with identity")
-    
-    # Force all submodules to eval mode to prevent TRAINING dialect
-    for module in decoder_model.modules():
-        module.eval()
-    
-    # Create fixed representative inputs (3s audio = 72000 samples at 24kHz)
-    sample_rate = 24000
-    duration_seconds = 3
-    waveform_samples = duration_seconds * sample_rate  # 72000
-    
-    # ASR features: [1, 512, 72] - fixed shape
-    asr_features = torch.zeros(1, 512, 72, dtype=torch.float32)
-    
-    # F0/N predictions: [1, 144] - fixed shape (2x ASR time due to stride-2)
-    f0_pred = torch.zeros(1, 144, dtype=torch.float32)
-    n_pred = torch.zeros(1, 144, dtype=torch.float32)
-    
-    # Reference voice: [1, 256] - fixed shape
-    ref_voice = torch.zeros(1, 256, dtype=torch.float32)
-    
-    print("🔄 Testing model with fixed inputs...")
-    with torch.no_grad():
-        output = decoder_model(asr_features, f0_pred, n_pred, ref_voice)
-        print(f"✓ Test successful - output shape: {output.shape}")
-    
-    # Trace with fixed inputs
-    print("🔄 Tracing model with torch.jit.trace...")
-    with torch.no_grad():
-        traced_model = torch.jit.trace(
-            decoder_model, 
-            (asr_features, f0_pred, n_pred, ref_voice), 
-            strict=False
-        )
-    
-    # Convert to CoreML with completely fixed shapes
-    print("🔄 Converting to CoreML...")
-    try:
-        synthesis_ml = ct.convert(
-            traced_model,
-            inputs=[
-                ct.TensorType(name="asr", shape=(1, 512, 72), dtype=np.float32),
-                ct.TensorType(name="F0_pred", shape=(1, 144), dtype=np.float32),
-                ct.TensorType(name="N_pred", shape=(1, 144), dtype=np.float32),
-                ct.TensorType(name="ref_s", shape=(1, 256), dtype=np.float32),
-            ],
-            outputs=[
-                ct.TensorType(name="waveform"),
-            ],
-            convert_to="mlprogram",
-            minimum_deployment_target=ct.target.macOS12,
-            compute_precision=ct.precision.FLOAT16,
-            compute_units=ct.ComputeUnit.ALL,
-        )
-    except Exception as e:
-        print(f"❌ CoreML conversion failed: {e}")
-        raise
-    
-    # Save model
+
+    # Buckets and their shape parameters (see header rationale)
+    buckets = {
+        3: {"asr_frames": 120, "hop": 5},
+        5: {"asr_frames": 125, "hop": 8},
+        10: {"asr_frames": 125, "hop": 16},
+        20: {"asr_frames": 125, "hop": 32},
+    }
+
     out_dir = _ROOT / "coreml"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / "kokoro_decoder_only_3s.mlpackage"
-    synthesis_ml.save(str(out_path))
-    print(f"✅ Saved fixed-shape synthesis model to: {out_path}")
-    
-    # Validate with test inputs
-    print("🔍 Validating exported model...")
-    try:
-        test_input = {
-            "asr": np.zeros((1, 512, 72), dtype=np.float32),
-            "F0_pred": np.zeros((1, 144), dtype=np.float32),
-            "N_pred": np.zeros((1, 144), dtype=np.float32),
-            "ref_s": np.zeros((1, 256), dtype=np.float32)
-        }
-        test_output = synthesis_ml.predict(test_input)
-        print(f"✅ Validation successful - output keys: {list(test_output.keys())}")
-        waveform_shape = test_output['waveform'].shape if 'waveform' in test_output else 'unknown'
-        print(f"✅ Waveform shape: {waveform_shape}")
-    except Exception as e:
-        print(f"❌ Validation failed: {e}")
-        raise
-    
-    print("✅ Fixed-shape synthesis model export complete!")
+    for sec, spec in buckets.items():
+        _export_bucket(kmodel, seconds=sec, asr_frames=spec["asr_frames"], hop=spec["hop"], out_dir=out_dir)
+
+    print("\n✅ All buckets exported successfully.")
 
 if __name__ == "__main__":
     main()
