@@ -974,17 +974,17 @@ Mitigations:
 - Next: update `dev_tokenize.py` to map phoneme strings to integer IDs consistently, or call a `KPipeline` API that returns ids directly. Once Python ids flow, Duration → Synth should produce intelligible speech.
 
 ## 22. TTS Ready Notification System Implementation — 2025-08-23
-## 22.5. 2025-08-24: F0/N integration and feature-map correctness
+## 22.5. 2025-08-24: F0/N integration and feature-map correctness (corrected)
 
-- Key discovery: Kokoro predicts F0/N from an aligned feature map derived from `d`, not from `t_en`.
+- Key discovery (corrected): Kokoro predicts F0/N from the same aligned feature map used by the decoder: `asr = t_en @ pred_aln_trg`.
 - Correct data flow:
   - Decoder input: `asr = t_en @ pred_aln_trg` → `[1,512,F]`.
-  - F0/N input: `en = (d^T @ pred_aln_trg)`; if `d_hid != 512`, repeat channels to 512; then concatenate broadcast `s` along channels to form `en640=[1,640,F]`.
-- Exporter gotchas fixed:
-  - Removed early “double style” concatenation that broke numerics (we now pass `s` only once and construct `en640` in Swift).
-  - Ensured F0N Core ML input contract is static: `en=[1,640,frames]`, `s=[1,128]`, outputs `F0_pred/N_pred=[1,2*frames]`.
-- Audible symptom from wrong map: feeding `t_en`-derived `asr` into F0/N caused breathy/whispery output (unvoiced bias).
-- Remaining work: validate `d` channel size and scaling vs. training; add optional normalization on `en` during bring-up; confirm tokenizer emits true phoneme IDs.
+  - F0/N input: `en640 = concat(asr[1,512,F], broadcast(s[1,128])→[1,128,F])` → `[1,640,F]`.
+- Exporter/Swift gotchas fixed:
+  - Avoided double style application; pass `s` once and build `en640` in Swift by concatenating `asr` with broadcast `s` along channels.
+  - F0N Core ML input contract remains static: `en=[1,640,frames]`, `s=[1,128]`, outputs `F0_pred/N_pred=[1,2*frames]`.
+- Audible symptom from wrong map: feeding `d`-derived features into F0/N produced breathy/whispery output (missing half the channels the LSTM expects).
+- Remaining work: optional per-channel normalization on `asr` (dev flag), ensure tokenizer emits real phoneme IDs.
 
 ### Problem Context: Race Condition Prevention
 
